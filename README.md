@@ -1,16 +1,24 @@
 <div align="center">
   <h1>📝 WordToWord</h1>
   <h3>基于 DeepSeek 的智能文档迁移与自动化填表系统</h3>
+
   <p>
     告别“Ctrl+C / Ctrl+V”，让 AI 帮你搞定繁琐的表格填写。
-    <br />
-    <br />
+  </p>
+
+  <a href="https://word-to-word.streamlit.app/" target="_blank">
+    <img src="https://static.streamlit.io/badges/streamlit_badge_black_white.svg" alt="Open in Streamlit">
+  </a>
+
+  <br />
+  <br />
+
+  <p>
     <a href="#-核心功能">核心功能</a> ·
     <a href="#-快速开始">快速开始</a> ·
-    <a href="#-演示截图">演示截图</a> ·
+    <a href="#-项目结构">项目结构</a> ·
     <a href="#-开源协议">开源协议</a>
   </p>
-  <br />
 
   <a href="https://www.python.org/">
     <img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python Version">
@@ -29,6 +37,14 @@
 <br />
 
 > **WordToWord** 是一款专为高校师生、行政人员及企业HR设计的**智能文档自动化工具**。它利用大语言模型（LLM）的深度语义理解能力，能够从非结构化的简历（PDF/Word）中提取信息，并精准填充到复杂的 Word 表格模板中。支持自动勾选、列表动态扩展及 AI 润色。
+
+---
+
+## 💻 在线演示 (Live Demo)
+
+👉 **点击立即体验 V1.0 版本：[https://word-to-word.streamlit.app/](https://word-to-word.streamlit.app/)**
+
+> *提示：为了体验完整功能，请自备 DeepSeek API Key 或兼容 OpenAI 格式的 Key。*
 
 ---
 
@@ -62,14 +78,13 @@
 
 ### 环境要求
 - Python 3.8+
-- DeepSeek API Key (或兼容 OpenAI 格式的 Key)
+- DeepSeek API Key
 
 ### 安装步骤
 
 1. **克隆仓库**
-   
    ```bash
-   git clone [https://github.com/YourUsername/WordToWord.git](https://github.com/YourUsername/WordToWord.git)
+   git clone [https://github.com/jiahao-bot/WordToWord.git](https://github.com/jiahao-bot/WordToWord.git)
    cd WordToWord
 
 1. **安装依赖**
@@ -80,9 +95,7 @@
    pip install -r requirements.txt
    ```
 
-   *(注：核心依赖包括 `streamlit`, `pandas`, `python-docx`, `pdfplumber`, `openai`)*
-
-2. **初始化数据库** 首次运行会自动创建 `wordtoword.db` SQLite 数据库。
+2. **配置环境** (可选) 复制 `.env.example` 为 `.env` 并配置本地管理员密码（部署到 Streamlit Cloud 时请使用 Secrets 配置）。
 
 3. **启动应用**
 
@@ -93,8 +106,6 @@
    ```
 
 4. **访问应用** 打开浏览器访问 `http://localhost:8501`。
-
-   - 首次使用，请在登录页点击“注册”创建新账号。
 
 ------
 
@@ -117,7 +128,7 @@ WordToWord/
 
 ## 🤝 贡献指南 (Contributing)
 
-欢迎提交 Issue 和 Pull Request！如果你有更好的 Prompt 优化建议或 Word 格式处理算法，请不要犹豫。
+欢迎提交 Issue 和 Pull Request！
 
 1. Fork 本仓库
 2. 新建分支 (`git checkout -b feature/AmazingFeature`)
@@ -139,5 +150,4 @@ WordToWord/
 
 ------
 
-<div align="center"> <p>Made with ❤️ by WordToWord</p> <p>Powered by <b>Streamlit</b> & <b>DeepSeek</b></p> </div>
-
+<div align="center"> <p>Made with ❤️ by <b>jiahao-bot</b></p> <p>Powered by <b>Streamlit</b> & <b>DeepSeek</b></p> </div>
