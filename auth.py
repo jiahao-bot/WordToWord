@@ -3,16 +3,24 @@ import hashlib
 import datetime
 import pandas as pd
 import os
+# 引入 streamlit 来读取云端配置
+import streamlit as st
 from dotenv import load_dotenv
 
-# 加载 .env 文件中的变量
 load_dotenv()
 
-# 从环境变量获取配置，如果没有则使用默认值 (防止报错)
-DB_FILE = os.getenv("DB_NAME", "wordtoword.db")
-ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
-# 如果没有设置密码，默认由系统生成一个随机hash，防止被猜到
-ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin123")
+# 定义一个读取配置的函数：优先读云端 Secrets，读不到再读本地 .env
+def get_config(key, default_value):
+    try:
+        # 尝试从 Streamlit Secrets 读取
+        return st.secrets[key]
+    except:
+        # 如果报错（比如在本地且没有配置 secrets.toml），则读取环境变量
+        return os.getenv(key, default_value)
+
+DB_FILE = get_config("DB_NAME", "wordtoword.db")
+ADMIN_USER = get_config("ADMIN_USERNAME", "admin")
+ADMIN_PASS = get_config("ADMIN_PASSWORD", "admin123")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
