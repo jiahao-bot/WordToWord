@@ -238,15 +238,22 @@ def user_page():
             p_template = os.path.join("temp", st.session_state.current_file_name)
             p_out = os.path.join("temp", f"V1.0_Result_{st.session_state.current_file_name}")
 
-            # 【关键修复】检查文件是否存在，如果不存在（云端常见问题），则从 session 恢复
-            if not os.path.exists(p_template):
-                if st.session_state.template_bytes:
-                    if not os.path.exists("temp"): os.makedirs("temp")
-                    with open(p_template, "wb") as f:
-                        f.write(st.session_state.template_bytes)
-                else:
-                    st.error("⚠️ 会话已过期或文件丢失，请刷新页面重新上传。")
+            # ======================= 核心修复 =======================
+            # 逻辑修改：不再只检查 exists，而是强制覆盖写入！
+            # 只要内存(session)里有备份，就重新写一遍文件，确保文件不为空、不损坏。
+            if st.session_state.get('template_bytes'):
+                # 确保目录存在
+                if not os.path.exists("temp"): os.makedirs("temp")
+                # 强制写入（wb模式会覆盖旧文件）
+                with open(p_template, "wb") as f:
+                    f.write(st.session_state.template_bytes)
+                print(f"【Debug】已从内存强制恢复文件: {p_template}")  # 后台打印日志
+            else:
+                # 如果内存里也没有，说明用户可能刷新了页面丢失了会话
+                if not os.path.exists(p_template):
+                    st.error("⚠️ 关键文件丢失（会话已过期）。请刷新页面重新开始任务。")
                     st.stop()
+            # ========================================================
 
             logic.execute_word_writing_v2(
                 st.session_state.plan, p_template, p_out, progress_callback=update_bar
@@ -256,7 +263,8 @@ def user_page():
 
             st.success("处理完成！")
             with open(p_out, "rb") as f:
-                st.download_button("📥 下载结果", f, file_name=f"WordToWord_V1.0_{st.session_state.current_file_name}",
+                st.download_button("📥 下载结果", f,
+                                   file_name=f"WordToWord_V1.0_{st.session_state.current_file_name}",
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                    type="primary", use_container_width=True)
 
@@ -266,6 +274,8 @@ def user_page():
                 st.rerun()
         except Exception as e:
             st.error(f"处理出错: {e}")
+            # 打印详细错误方便调试
+            print(f"Error detail: {str(e)}")
 
 
 # ================= 路由 =================
