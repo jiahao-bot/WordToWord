@@ -76,6 +76,9 @@ def admin_page():
 
 # ================= 用户工作台 =================
 def user_page():
+    # --- 【新增】初始化一个固定的档案名，防止每次刷新都变 ---
+    if 'auto_profile_name' not in st.session_state:
+        st.session_state.auto_profile_name = f"{st.session_state.username}的简历_{int(time.time())}"
     # --- 1. 侧边栏 (记忆功能核心) ---
     with st.sidebar:
         st.title("设置")
@@ -147,8 +150,14 @@ def user_page():
 
             # 档案保存选项
             save_profile = st.checkbox("💾 将此源文件存为档案 (方便下次直接用)", value=True)
+            # 【修改】使用 session_state 中的固定名字作为 value
             profile_name = st.text_input("档案名称",
-                                         value=f"{st.session_state.username}的简历_{int(time.time())}") if save_profile else ""
+                                         value=st.session_state.auto_profile_name,
+                                         key="input_profile_name") if save_profile else ""
+
+            # 【新增】如果不加这一行，用户修改后的值可能无法即时回写到 auto_profile_name 用于下一次刷新
+            if save_profile and profile_name:
+                st.session_state.auto_profile_name = profile_name
 
         # 方式 B: 档案
         with t2:
@@ -330,15 +339,27 @@ def user_page():
             st.success("处理完成！")
 
             output_name = f"WordToWord_V1.0_{st.session_state.user_filename_display}"
-            with open(p_out, "rb") as f:
-                st.download_button("📥 下载结果", f, file_name=output_name,
-                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                   type="primary", use_container_width=True)
+            # === 修改开始：使用三列布局优化按钮排版 ===
+            col_dl, col_back, col_new = st.columns([3, 2, 2])
 
-            # 成功后也给一个返回按钮
-            if st.button("🔄 开始新任务"):
+            with open(p_out, "rb") as f:
+                col_dl.download_button("📥 下载结果", f, file_name=output_name,
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       type="primary", use_container_width=True)
+
+            # 【新增功能】返回上一步
+            if col_back.button("✏️ 不满意？返回修改"):
+                st.session_state.step = 2  # 关键：倒退回步骤 2
+                st.rerun()  # 立即刷新，编辑器会重新出现，数据还在
+
+            if col_new.button("🔄 开始新任务"):
                 st.session_state.step = 1
+                # 清除旧的默认名
+                if 'auto_profile_name' in st.session_state:
+                    del st.session_state.auto_profile_name
+                st.session_state.plan = None  # 彻底清空，防止数据残留
                 st.rerun()
+            # === 修改结束 ===
 
         except Exception as e:
             st.error(f"写入出错: {e}")

@@ -1,6 +1,7 @@
 import json
 import re
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.shared import Pt, RGBColor
 from docx.oxml.ns import qn
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
@@ -267,6 +268,58 @@ def get_fuzzy_score(anchor, target_text):
     return difflib.SequenceMatcher(None, a, t).ratio()
 
 
+# --- 辅助函数：设置单元格为纵向合并的“继续”状态 ---
+def set_cell_merge_continue(cell):
+    """
+    修改单元格 XML，使其属性变为 vMerge="continue" (即合并单元格的非首行部分)
+    """
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    # 查找现有的 vMerge
+    vMerge = tcPr.find(qn('w:vMerge'))
+    if vMerge is None:
+        vMerge = OxmlElement('w:vMerge')
+        tcPr.append(vMerge)
+    # vMerge 标签没有 val 属性时，默认为 continue
+    if 'w:val' in vMerge.attrib:
+        del vMerge.attrib['w:val']
+
+# --- 辅助函数：在指定行之后插入新行 ---
+def insert_row_after(table, ref_row):
+    """
+    在 ref_row 之后插入一行，并复制 ref_row 的样式
+    """
+    tbl = table._tbl
+    new_tr = deepcopy(ref_row._tr)
+    ref_row._tr.addnext(new_tr)
+    # 找到新插入的行对象
+    new_row_idx = ref_row._index + 1
+    return table.rows[new_row_idx]
+
+def get_row_merge_range(table, row_idx, col_idx):
+    """
+    计算纵向合并范围 (start, end)
+    """
+    start_cell = table.rows[row_idx].cells[col_idx]
+    start_element = start_cell._element
+    end_row = row_idx
+    for r in range(row_idx + 1, len(table.rows)):
+        current_cell = table.rows[r].cells[col_idx]
+        if current_cell._element is start_element:
+            end_row = r
+        else:
+            break
+    return row_idx, end_row
+
+def find_column_index_by_header(row, header_texts):
+    mapping = {}
+    for idx, cell in enumerate(row.cells):
+        txt = cell.text.strip().replace(" ", "")
+        for h in header_texts:
+            if h in txt:
+                mapping[h] = idx
+    return mapping
+
 def execute_word_writing_v2(plan, template_path, output_path, progress_callback=None):
     if not zipfile.is_zipfile(template_path):
         raise ValueError("目标文件格式错误")
@@ -321,48 +374,144 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                     if keyword in cell.text:
                         handle_checkbox(cell, status)
 
-    # ---------------- 3. Lists 写入 (保持稳定) ----------------
+    # 3. Lists 写入 (✨ 修复表头被顶飞的问题 ✨)
     if progress_callback: progress_callback(80, "处理表格列表...")
+
     for item in plan.get("lists", []):
         keyword = item["keyword"]
-        data = item["data"]
+        headers = item.get("headers", [])
+        data = item.get("data", [])
+
         if not data: continue
 
+        # A. 定位锚点
         target_table = None
-        template_row_idx = -1
+        anchor_row_idx = -1
+        anchor_col_idx = -1
 
-        for table in doc.tables:
+        found = False
+        for t_idx, table in enumerate(doc.tables):
             for r_idx, row in enumerate(table.rows):
-                row_txt = "".join([c.text for c in row.cells])
-                if keyword in row_txt:
-                    for offset in range(1, 4):
-                        if r_idx + offset < len(table.rows):
-                            check_row = table.rows[r_idx + offset]
-                            check_txt = "".join([c.text for c in check_row.cells])
-                            if "xx" in check_txt.lower() or len(check_txt.strip()) < 5:
-                                target_table = table
-                                template_row_idx = r_idx + offset
-                                break
-                    if target_table: break
-            if target_table: break
+                for c_idx, cell in enumerate(row.cells):
+                    if keyword in cell.text:
+                        target_table = table
+                        anchor_row_idx = r_idx
+                        anchor_col_idx = c_idx
+                        found = True
+                        break
+                if found: break
+            if found: break
 
-        if target_table:
-            template_row = target_table.rows[template_row_idx]
+        if not found:
+            continue
 
-            for data_row in data:
-                new_row = deepcopy_row(target_table, template_row)
-                distinct_cells = []
-                if len(new_row.cells) > 0:
-                    distinct_cells.append(new_row.cells[0])
-                    for i in range(1, len(new_row.cells)):
-                        if new_row.cells[i]._element is not new_row.cells[i - 1]._element:
-                            distinct_cells.append(new_row.cells[i])
+        # B. 判读当前版块类型
+        start_r, end_r = get_row_merge_range(target_table, anchor_row_idx, anchor_col_idx)
+        is_side_block = (end_r > start_r)  # 是否为侧边栏合并类型
 
-                for i, val in enumerate(data_row):
-                    if i < len(distinct_cells):
-                        force_write_cell(distinct_cells[i], val, alignment="auto")
+        # C. 智能确定数据起始行 (Fix: 防止写在表头上面)
+        header_map = find_column_index_by_header(target_table.rows[anchor_row_idx], headers)
+        data_start_row = anchor_row_idx  # 默认从锚点行开始算
 
-            target_table._tbl.remove(template_row._tr)
+        # 策略：向下一行探测
+        if anchor_row_idx + 1 < len(target_table.rows):
+            next_row = target_table.rows[anchor_row_idx + 1]
+            next_row_text = "".join([c.text for c in next_row.cells]).strip()
+
+            # 1. 尝试在下一行精准匹配表头
+            candidate_map = find_column_index_by_header(next_row, headers)
+
+            if candidate_map:
+                # 命中表头！
+                header_map = candidate_map
+                data_start_row = anchor_row_idx + 1
+
+            elif not is_side_block:
+                # 2. 【关键修复】如果是普通模式，且没匹配到表头，但下一行明显有文字
+                # 我们假设下一行就是表头（比如 Word 里是“课程名称”，AI 识别成“课程名”，导致没匹配上）
+                # 这种情况下，我们强制跳过下一行，从下下行开始写
+                if len(next_row_text) > 2 and (
+                        "课程" in next_row_text or "名称" in next_row_text or "成绩" in next_row_text or "Date" in next_row_text):
+                    data_start_row = anchor_row_idx + 1  # 把下一行视为表头
+
+        # 确定游标初始位置：总是从 data_start_row 的下一行开始写
+        cursor_row_idx = data_start_row + 1
+
+        # 【关键修复】同步边界 end_r
+        # 如果是普通模式，end_r 初始值可能就是锚点行(0)。
+        # 但如果我们要从 Row 2 开始写，必须把 end_r 至少推到 Row 2 的前一行，防止 cursor > end_r 导致在 Row 0 后面插入
+        # 简单来说：在普通模式下，只要表格里还有空行，就不要急着插入。
+        if not is_side_block:
+            # 只要 cursor 指向的行存在，我们就认为它在边界内
+            if cursor_row_idx < len(target_table.rows):
+                end_r = max(end_r, cursor_row_idx)
+
+        # D. 循环填入数据
+        for data_idx, data_row in enumerate(data):
+
+            # 检查是否越界/需要扩容
+            if cursor_row_idx > end_r:
+
+                # === 扩容逻辑 ===
+                # 复制模板：普通模式下，尽量复制上一行（即数据行样式）；侧边栏模式复制最后一行
+                template_row_idx = end_r
+                if not is_side_block and cursor_row_idx > 0:
+                    template_row_idx = cursor_row_idx - 1
+
+                # 安全检查
+                if template_row_idx >= len(target_table.rows): template_row_idx = len(target_table.rows) - 1
+
+                last_row = target_table.rows[template_row_idx]
+                new_row = insert_row_after(target_table, last_row)
+
+                # === 样式处理 ===
+                if is_side_block:
+                    # 侧边栏模式：保留锚点列，清空其他
+                    for idx, cell in enumerate(new_row.cells):
+                        if idx == anchor_col_idx:
+                            pass
+                        else:
+                            cell._element.clear_content()
+                    # 修复左侧合并
+                    merge_cell = new_row.cells[anchor_col_idx]
+                    set_cell_merge_continue(merge_cell)
+                else:
+                    # 普通模式：清空所有列，不合并
+                    for cell in new_row.cells:
+                        cell._element.clear_content()
+
+                end_r += 1
+                # ===================
+
+            # E. 执行写入
+            if cursor_row_idx >= len(target_table.rows): break
+            current_row = target_table.rows[cursor_row_idx]
+
+            if header_map:
+                # 有表头映射
+                for h_text, col_idx in header_map.items():
+                    try:
+                        val_idx = headers.index(h_text)
+                        if val_idx < len(data_row):
+                            force_write_cell(current_row.cells[col_idx], data_row[val_idx])
+                    except:
+                        pass
+            else:
+                # 无表头映射（盲填）
+                start_col = anchor_col_idx + 1 if is_side_block else 0
+                write_col = start_col
+                data_ptr = 0
+                while write_col < len(current_row.cells) and data_ptr < len(data_row):
+                    cell = current_row.cells[write_col]
+                    # 跳过合并列(水平)
+                    if write_col > 0 and cell._element is current_row.cells[write_col - 1]._element:
+                        write_col += 1
+                        continue
+                    force_write_cell(cell, data_row[data_ptr])
+                    data_ptr += 1
+                    write_col += 1
+
+            cursor_row_idx += 1
 
     doc.save(output_path)
     if progress_callback: progress_callback(100, "完成")
