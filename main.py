@@ -14,14 +14,15 @@ st.set_page_config(page_title="WordToWord V1.0", page_icon="📝", layout="wide"
 styles.inject_css()
 auth.init_db()
 
-# Session State
+# Session State 初始化
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_role' not in st.session_state: st.session_state.user_role = None
 if 'username' not in st.session_state: st.session_state.username = ""
 if 'step' not in st.session_state: st.session_state.step = 1
 if 'plan' not in st.session_state: st.session_state.plan = None
-# 新增：防止内存报错
 if 'template_bytes' not in st.session_state: st.session_state.template_bytes = None
+# 新增：专门用来存用户原始文件名的变量，只用于显示和下载，不用于路径
+if 'user_filename_display' not in st.session_state: st.session_state.user_filename_display = "template.docx"
 
 
 # ================= 登录页 =================
@@ -140,8 +141,13 @@ def user_page():
                     st.error("请在侧边栏输入 API Key")
                 else:
                     if not os.path.exists("temp"): os.makedirs("temp")
-                    p_old = os.path.join("temp", f_old.name)
-                    p_new = os.path.join("temp", f_new.name)
+
+                    # 【核心修改点 1】强制使用英文文件名保存到服务器，避开中文路径坑
+                    # 源文件重命名
+                    old_ext = os.path.splitext(f_old.name)[1]
+                    p_old = os.path.join("temp", f"source_file{old_ext}")
+                    # 目标模板强制重命名为 target_template.docx
+                    p_new = os.path.join("temp", "target_template.docx")
 
                     # 写入临时文件
                     with open(p_old, "wb") as f:
@@ -149,9 +155,10 @@ def user_page():
                     with open(p_new, "wb") as f:
                         f.write(f_new.getbuffer())
 
-                    # 【关键修复】将文件内容备份到 session，防止步骤切换后文件丢失
+                    # 备份数据到 Session
                     st.session_state.template_bytes = f_new.getvalue()
-                    st.session_state.current_file_name = f_new.name
+                    # 只记录原始文件名用于展示，不用于路径
+                    st.session_state.user_filename_display = f_new.name
 
                     with st.spinner("正在读取文档并构建知识图谱..."):
                         try:
@@ -235,36 +242,34 @@ def user_page():
             time.sleep(0.05)
 
         try:
-            p_template = os.path.join("temp", st.session_state.current_file_name)
-            p_out = os.path.join("temp", f"V1.0_Result_{st.session_state.current_file_name}")
+            # 【核心修改点 2】全程使用固定的英文文件名，不管用户原来传的是什么
+            p_template = os.path.join("temp", "target_template.docx")
+            p_out = os.path.join("temp", "final_result.docx")
 
-            # ======================= 核心修复 =======================
-            # 逻辑修改：不再只检查 exists，而是强制覆盖写入！
-            # 只要内存(session)里有备份，就重新写一遍文件，确保文件不为空、不损坏。
+            # 强制覆盖逻辑
             if st.session_state.get('template_bytes'):
-                # 确保目录存在
                 if not os.path.exists("temp"): os.makedirs("temp")
-                # 强制写入（wb模式会覆盖旧文件）
                 with open(p_template, "wb") as f:
                     f.write(st.session_state.template_bytes)
-                print(f"【Debug】已从内存强制恢复文件: {p_template}")  # 后台打印日志
             else:
-                # 如果内存里也没有，说明用户可能刷新了页面丢失了会话
                 if not os.path.exists(p_template):
-                    st.error("⚠️ 关键文件丢失（会话已过期）。请刷新页面重新开始任务。")
+                    st.error("⚠️ 关键文件丢失（会话已过期）。请刷新页面重新上传。")
                     st.stop()
-            # ========================================================
 
             logic.execute_word_writing_v2(
                 st.session_state.plan, p_template, p_out, progress_callback=update_bar
             )
 
-            auth.log_action(st.session_state.username, f"Completed: {st.session_state.current_file_name}")
+            auth.log_action(st.session_state.username, f"Completed: {st.session_state.user_filename_display}")
 
             st.success("处理完成！")
+
+            # 【核心修改点 3】下载时，把文件名偷偷改回用户原来的名字
+            output_name = f"WordToWord_V1.0_{st.session_state.user_filename_display}"
+
             with open(p_out, "rb") as f:
                 st.download_button("📥 下载结果", f,
-                                   file_name=f"WordToWord_V1.0_{st.session_state.current_file_name}",
+                                   file_name=output_name,
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                    type="primary", use_container_width=True)
 
@@ -274,7 +279,6 @@ def user_page():
                 st.rerun()
         except Exception as e:
             st.error(f"处理出错: {e}")
-            # 打印详细错误方便调试
             print(f"Error detail: {str(e)}")
 
 
