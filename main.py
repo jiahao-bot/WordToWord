@@ -142,23 +142,34 @@ def user_page():
                 else:
                     if not os.path.exists("temp"): os.makedirs("temp")
 
-                    # 【核心修改点 1】强制使用英文文件名保存到服务器，避开中文路径坑
-                    # 源文件重命名
+                    # 1. 强制使用英文文件名保存到服务器
                     old_ext = os.path.splitext(f_old.name)[1]
                     p_old = os.path.join("temp", f"source_file{old_ext}")
-                    # 目标模板强制重命名为 target_template.docx
                     p_new = os.path.join("temp", "target_template.docx")
 
-                    # 写入临时文件
+                    # 2. 写入临时文件
                     with open(p_old, "wb") as f:
                         f.write(f_old.getbuffer())
                     with open(p_new, "wb") as f:
                         f.write(f_new.getbuffer())
 
-                    # 备份数据到 Session
+                    # 3. 备份数据到 Session
                     st.session_state.template_bytes = f_new.getvalue()
-                    # 只记录原始文件名用于展示，不用于路径
                     st.session_state.user_filename_display = f_new.name
+
+                    # ========================================================
+                    # 【核心修改】在此处立刻检查文件格式！防止 Token 浪费
+                    # ========================================================
+                    is_valid_new, err_msg_new = logic.validate_file_format(p_new)
+                    if not is_valid_new:
+                        st.error(err_msg_new)
+                        st.stop()  # 🛑 立即停止，不扣费
+
+                    is_valid_old, err_msg_old = logic.validate_file_format(p_old)
+                    if not is_valid_old:
+                        st.error(f"源文件错误：{err_msg_old}")
+                        st.stop()  # 🛑 立即停止
+                    # ========================================================
 
                     with st.spinner("正在读取文档并构建知识图谱..."):
                         try:
@@ -166,6 +177,7 @@ def user_page():
                             old_txt = logic.read_file_content(p_old)
                             new_txt = logic.read_file_content(p_new)
 
+                            # 只有上面文件检查通过了，才会走到这一步扣费
                             plan = logic.generate_filling_plan_v2(client, old_txt, new_txt)
 
                             st.session_state.plan = plan
@@ -242,7 +254,7 @@ def user_page():
             time.sleep(0.05)
 
         try:
-            # 【核心修改点 2】全程使用固定的英文文件名，不管用户原来传的是什么
+            # 文件名
             p_template = os.path.join("temp", "target_template.docx")
             p_out = os.path.join("temp", "final_result.docx")
 
@@ -264,7 +276,7 @@ def user_page():
 
             st.success("处理完成！")
 
-            # 【核心修改点 3】下载时，把文件名偷偷改回用户原来的名字
+            # 下载逻辑
             output_name = f"WordToWord_V1.0_{st.session_state.user_filename_display}"
 
             with open(p_out, "rb") as f:

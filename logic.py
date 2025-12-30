@@ -6,7 +6,7 @@ from docx.oxml.ns import qn
 from copy import deepcopy
 from openai import OpenAI
 import os
-import zipfile  # <--- 【新增】引入这个库用来检测文件坏没坏
+import zipfile  # <--- 必须导入这个
 
 # 尝试导入 pdfplumber
 try:
@@ -15,12 +15,49 @@ except ImportError:
     pdfplumber = None
 
 
+# ================== 新增：文件格式预检工具 ==================
+def validate_file_format(file_path):
+    """
+    在调用 LLM 之前检查文件格式。
+    如果文件是坏的，返回 (False, 错误原因)。
+    """
+    if not os.path.exists(file_path):
+        return False, "文件上传失败，未能保存到服务器。"
+
+    filename = os.path.basename(file_path)
+    ext = os.path.splitext(filename)[1].lower()
+
+    # 1. 检查 DOCX (必须是 zip 格式)
+    if ext == '.docx':
+        if not zipfile.is_zipfile(file_path):
+            return False, f"❌ 文件【{filename}】格式错误！\n它看起来像是一个被强制改名的旧版 .doc 文件，或者是损坏的文件。\n\n💡 解决方法：请在本地用 Word 打开它，选择‘另存为’ -> ‘Word 文档 (*.docx)’。"
+
+        # 进一步尝试用 docx 库打开一下，确保结构没烂
+        try:
+            Document(file_path)
+        except Exception as e:
+            return False, f"❌ 文件【{filename}】内容已损坏，无法读取。\n错误详情: {str(e)}"
+
+    # 2. 检查 PDF
+    elif ext == '.pdf':
+        if pdfplumber is None:
+            return False, "系统缺少 pdfplumber 库，无法处理 PDF。"
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                if len(pdf.pages) == 0:
+                    return False, "❌ PDF 文件是空的。"
+        except Exception as e:
+            return False, f"❌ PDF 文件损坏或加密，无法读取。\n错误详情: {str(e)}"
+
+    return True, "OK"
+
+
 # ================= 文本读取逻辑 =================
 
 def _read_pdf(file_path):
     """专门读取 PDF 文本"""
     if pdfplumber is None:
-        return "[系统错误] 缺少 pdfplumber 库，请运行 pip install pdfplumber 安装。"
+        return ""
 
     text_content = []
     try:
@@ -46,11 +83,6 @@ def read_file_content(file_path):
 
     if ext == '.pdf':
         return _read_pdf(file_path)
-
-    # 增加 docx 格式预检
-    if not zipfile.is_zipfile(file_path):
-        # 如果不是 PDF 也不是合法的 zip (docx本质是zip)，尝试作为纯文本或报错
-        return f"[严重警告] 文件 '{os.path.basename(file_path)}' 不是有效的 .docx 格式。\n请不要直接修改后缀名，请用 Word 打开后‘另存为’ .docx。"
 
     try:
         doc = Document(file_path)
@@ -106,7 +138,6 @@ def generate_filling_plan_v2(client, old_data, target_structure):
     try:
         return json.loads(content)
     except:
-        # 简单的容错，防止 JSON 解析失败导致崩溃
         return {"kv": [], "checkbox": [], "lists": []}
 
 
@@ -174,11 +205,7 @@ def deepcopy_row(table, source_row):
 
 
 def execute_word_writing_v2(plan, template_path, output_path, progress_callback=None):
-    # 【新增】这里就是核心修复！在打开文件前，先检查它是不是真正的 Docx
-    if not zipfile.is_zipfile(template_path):
-        raise ValueError(
-            "❌ 上传的【目标文件】格式错误！\n它可能是一个旧版 .doc 文件被直接改了后缀名。\n\n💡 解决方法：\n请在电脑上用 Word 打开该文件，点击‘文件’ -> ‘另存为’ -> 选择 ‘Word 文档 (*.docx)’，然后上传新保存的文件。")
-
+    # 写入阶段就不需要再检查了，因为第一步已经拦截了
     doc = Document(template_path)
 
     # 1. KV
