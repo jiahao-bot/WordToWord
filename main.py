@@ -20,13 +20,15 @@ if 'user_role' not in st.session_state: st.session_state.user_role = None
 if 'username' not in st.session_state: st.session_state.username = ""
 if 'step' not in st.session_state: st.session_state.step = 1
 if 'plan' not in st.session_state: st.session_state.plan = None
+# 新增：防止内存报错
+if 'template_bytes' not in st.session_state: st.session_state.template_bytes = None
+
 
 # ================= 登录页 =================
 def login_page():
     c1, c2, c3 = st.columns([1, 1, 1])
     with c2:
         st.markdown("<br><br>", unsafe_allow_html=True)
-        # 1. 顶部 Logo (修复代码块问题)
         st.markdown(styles.get_logo_html(), unsafe_allow_html=True)
 
         tab1, tab2 = st.tabs(["🔐 登录", "📝 注册"])
@@ -53,6 +55,7 @@ def login_page():
                         st.success("注册成功，请登录")
                     else:
                         st.error("用户名已存在")
+
 
 # ================= 管理员后台 =================
 def admin_page():
@@ -81,6 +84,7 @@ def admin_page():
     st.caption("系统日志")
     st.dataframe(logs, use_container_width=True)
 
+
 # ================= 用户工作台 =================
 def user_page():
     # --- 侧边栏 ---
@@ -93,7 +97,6 @@ def user_page():
             st.success("✅ API Key 已就绪")
 
         st.divider()
-        # 【关键】这里必须确保 unsafe_allow_html=True 才能正确渲染 Guide
         with st.expander("📖 V1.0 使用指南", expanded=True):
             st.markdown(styles.get_guide_html(), unsafe_allow_html=True)
 
@@ -110,7 +113,6 @@ def user_page():
             st.rerun()
 
     # --- 主界面 ---
-    # 2. 主界面 Logo
     c_logo, c_user = st.columns([3, 1])
     with c_logo:
         st.markdown(styles.get_logo_html(), unsafe_allow_html=True)
@@ -140,11 +142,15 @@ def user_page():
                     if not os.path.exists("temp"): os.makedirs("temp")
                     p_old = os.path.join("temp", f_old.name)
                     p_new = os.path.join("temp", f_new.name)
+
+                    # 写入临时文件
                     with open(p_old, "wb") as f:
                         f.write(f_old.getbuffer())
                     with open(p_new, "wb") as f:
                         f.write(f_new.getbuffer())
 
+                    # 【关键修复】将文件内容备份到 session，防止步骤切换后文件丢失
+                    st.session_state.template_bytes = f_new.getvalue()
                     st.session_state.current_file_name = f_new.name
 
                     with st.spinner("正在读取文档并构建知识图谱..."):
@@ -232,6 +238,16 @@ def user_page():
             p_template = os.path.join("temp", st.session_state.current_file_name)
             p_out = os.path.join("temp", f"V1.0_Result_{st.session_state.current_file_name}")
 
+            # 【关键修复】检查文件是否存在，如果不存在（云端常见问题），则从 session 恢复
+            if not os.path.exists(p_template):
+                if st.session_state.template_bytes:
+                    if not os.path.exists("temp"): os.makedirs("temp")
+                    with open(p_template, "wb") as f:
+                        f.write(st.session_state.template_bytes)
+                else:
+                    st.error("⚠️ 会话已过期或文件丢失，请刷新页面重新上传。")
+                    st.stop()
+
             logic.execute_word_writing_v2(
                 st.session_state.plan, p_template, p_out, progress_callback=update_bar
             )
@@ -249,7 +265,8 @@ def user_page():
                 st.session_state.step = 1
                 st.rerun()
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"处理出错: {e}")
+
 
 # ================= 路由 =================
 if not st.session_state.logged_in:
