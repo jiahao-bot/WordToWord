@@ -14,15 +14,16 @@ st.set_page_config(page_title="WordToWord V1.0", page_icon="📝", layout="wide"
 styles.inject_css()
 auth.init_db()
 
-# Session State 初始化
+# Session State
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_role' not in st.session_state: st.session_state.user_role = None
 if 'username' not in st.session_state: st.session_state.username = ""
 if 'step' not in st.session_state: st.session_state.step = 1
 if 'plan' not in st.session_state: st.session_state.plan = None
 if 'template_bytes' not in st.session_state: st.session_state.template_bytes = None
-# 新增：专门用来存用户原始文件名的变量，只用于显示和下载，不用于路径
 if 'user_filename_display' not in st.session_state: st.session_state.user_filename_display = "template.docx"
+# 新增：用于存储当前使用的源数据文本（用于展示）
+if 'source_text_display' not in st.session_state: st.session_state.source_text_display = ""
 
 
 # ================= 登录页 =================
@@ -62,52 +63,45 @@ def login_page():
 def admin_page():
     st.markdown(styles.get_logo_html(), unsafe_allow_html=True)
     st.markdown("### 🛠️ 管理员控制台")
-
     if st.button("退出登录"):
         st.session_state.logged_in = False
         st.rerun()
-
     users, logs, fb = auth.get_admin_data()
     m1, m2, m3 = st.columns(3)
     m1.metric("总用户数", len(users))
     m2.metric("累计任务", len(logs))
     m3.metric("平均满意度", f"{fb['rating'].mean():.1f}" if not fb.empty else "0.0")
-
-    st.markdown("---")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.caption("用户列表")
-        st.dataframe(users, use_container_width=True, height=250)
-    with c2:
-        st.caption("最新反馈")
-        st.dataframe(fb, use_container_width=True, height=250)
-
-    st.caption("系统日志")
     st.dataframe(logs, use_container_width=True)
 
 
 # ================= 用户工作台 =================
 def user_page():
-    # --- 侧边栏 ---
+    # --- 1. 侧边栏 (记忆功能核心) ---
     with st.sidebar:
         st.title("设置")
-        api_key = st.text_input("DeepSeek API Key", type="password")
-        if not api_key:
-            st.warning("⚠️ 请输入 API Key")
-        else:
-            st.success("✅ API Key 已就绪")
+        # 自动加载 API Key
+        saved_key = auth.get_user_apikey(st.session_state.username)
+        api_key = st.text_input("DeepSeek API Key", value=saved_key, type="password")
+
+        # 如果 Key 变了，自动保存
+        if api_key != saved_key and api_key:
+            auth.save_user_apikey(st.session_state.username, api_key)
+            st.toast("✅ API Key 已自动保存")
+
+        if not api_key: st.warning("⚠️ 请输入 API Key")
 
         st.divider()
-        with st.expander("📖 V1.0 使用指南", expanded=True):
+        with st.expander("📖 V1.0 使用指南", expanded=False):
             st.markdown(styles.get_guide_html(), unsafe_allow_html=True)
 
+        # 档案管理
         st.divider()
-        with st.form("fb"):
-            score = st.slider("评分", 1, 5, 5)
-            txt = st.text_area("反馈")
-            if st.form_submit_button("提交"):
-                auth.submit_feedback(st.session_state.username, txt, score)
-                st.success("已提交")
+        st.caption("📚 我的档案库")
+        profiles_df = auth.get_user_profiles(st.session_state.username)
+        if not profiles_df.empty:
+            st.dataframe(profiles_df[['profile_name', 'created_at']], hide_index=True)
+        else:
+            st.info("暂无存档，上传文件后可保存。")
 
         if st.button("退出登录"):
             st.session_state.logged_in = False
@@ -122,81 +116,149 @@ def user_page():
             f"<div style='text-align:right; color:#64748b; padding-top:20px;'>👤 {st.session_state.username}</div>",
             unsafe_allow_html=True)
 
-    # 步骤 1: 上传
+    # ================== 步骤 1: 建立任务 (档案/上传) ==================
     if st.session_state.step == 1:
-        st.markdown("""
-        <div class="w2w-card">
-            <div class="w2w-header">📂 步骤 1: 建立任务</div>
-            <div class="w2w-desc">系统已升级，现在支持直接读取 PDF 格式的简历或非结构化 Word 文档。</div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            """<div class="w2w-card"><div class="w2w-header">📂 步骤 1: 建立任务</div><div class="w2w-desc">选择已有档案，或上传新文件。</div>""",
+            unsafe_allow_html=True)
 
-        c1, c2 = st.columns(2)
-        f_old = c1.file_uploader("源文件 (简历/旧表格)", type=["docx", "pdf"], key="old")
-        f_new = c2.file_uploader("目标文件 (空白模板)", type=["docx"], key="new")
+        # 核心升级：Tab页切换
+        t1, t2 = st.tabs(["📤 上传新简历", "🗂️ 从档案库选择"])
+
+        p_old_text = None  # 用于存储最终选定的源文本
+
+        # 方式 A: 上传
+        with t1:
+            c1, c2 = st.columns(2)
+            f_old = c1.file_uploader("源文件 (简历/旧表格)", type=["docx", "pdf"], key="old")
+            f_new = c2.file_uploader("目标文件 (空白模板)", type=["docx"], key="new")
+
+            # 立即检测 (UI 交互改进)
+            if f_new:
+                if not os.path.exists("temp"): os.makedirs("temp")
+                temp_check_path = os.path.join("temp", "check_template.docx")
+                with open(temp_check_path, "wb") as f:
+                    f.write(f_new.getbuffer())
+
+                valid, msg = logic.validate_file_format(temp_check_path)
+                if not valid:
+                    st.error(msg)
+                    st.stop()  # 🛑 立即停止，不让用户点开始
+
+            # 档案保存选项
+            save_profile = st.checkbox("💾 将此源文件存为档案 (方便下次直接用)", value=True)
+            profile_name = st.text_input("档案名称",
+                                         value=f"{st.session_state.username}的简历_{int(time.time())}") if save_profile else ""
+
+        # 方式 B: 档案
+        with t2:
+            profiles = auth.get_user_profiles(st.session_state.username)
+            selected_profile_name = st.selectbox("选择档案",
+                                                 profiles['profile_name'].tolist() if not profiles.empty else [])
+            f_new_archive = st.file_uploader("目标文件 (空白模板)", type=["docx"], key="new_archive")
+            if not profiles.empty and selected_profile_name:
+                p_old_text = profiles[profiles['profile_name'] == selected_profile_name]['content_text'].values[0]
+                st.info(f"✅ 已加载档案内容 (长度: {len(p_old_text)} 字)")
 
         st.markdown("<br>", unsafe_allow_html=True)
-        if f_old and f_new:
-            if st.button("🚀 开始 AI 分析 (V1.0)", type="primary", use_container_width=True):
-                if not api_key:
-                    st.error("请在侧边栏输入 API Key")
-                else:
-                    if not os.path.exists("temp"): os.makedirs("temp")
 
-                    # 1. 强制使用英文文件名保存到服务器
-                    old_ext = os.path.splitext(f_old.name)[1]
-                    p_old = os.path.join("temp", f"source_file{old_ext}")
-                    p_new = os.path.join("temp", "target_template.docx")
+        # 统一处理开始逻辑
+        start_btn = st.button("🚀 开始 AI 分析 (V1.0)", type="primary", use_container_width=True)
 
-                    # 2. 写入临时文件
-                    with open(p_old, "wb") as f:
-                        f.write(f_old.getbuffer())
-                    with open(p_new, "wb") as f:
-                        f.write(f_new.getbuffer())
+        if start_btn:
+            if not api_key:
+                st.error("请先在左侧输入 API Key")
+                st.stop()
 
-                    # 3. 备份数据到 Session
-                    st.session_state.template_bytes = f_new.getvalue()
-                    st.session_state.user_filename_display = f_new.name
+            # 确定源数据来源
+            final_old_txt = ""
+            final_new_path = ""
 
-                    # ========================================================
-                    # 【核心修改】在此处立刻检查文件格式！防止 Token 浪费
-                    # ========================================================
-                    is_valid_new, err_msg_new = logic.validate_file_format(p_new)
-                    if not is_valid_new:
-                        st.error(err_msg_new)
-                        st.stop()  # 🛑 立即停止，不扣费
+            # 路径 1: 新上传
+            if f_old and f_new:
+                if not os.path.exists("temp"): os.makedirs("temp")
+                # 保存源文件
+                old_ext = os.path.splitext(f_old.name)[1]
+                p_old_path = os.path.join("temp", f"source_file{old_ext}")
+                with open(p_old_path, "wb") as f:
+                    f.write(f_old.getbuffer())
 
-                    is_valid_old, err_msg_old = logic.validate_file_format(p_old)
-                    if not is_valid_old:
-                        st.error(f"源文件错误：{err_msg_old}")
-                        st.stop()  # 🛑 立即停止
-                    # ========================================================
+                # 保存目标文件 (英文名)
+                final_new_path = os.path.join("temp", "target_template.docx")
+                with open(final_new_path, "wb") as f:
+                    f.write(f_new.getbuffer())
 
-                    with st.spinner("正在读取文档并构建知识图谱..."):
-                        try:
-                            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-                            old_txt = logic.read_file_content(p_old)
-                            new_txt = logic.read_file_content(p_new)
+                # 读取内容
+                final_old_txt = logic.read_file_content(p_old_path)
 
-                            # 只有上面文件检查通过了，才会走到这一步扣费
-                            plan = logic.generate_filling_plan_v2(client, old_txt, new_txt)
+                # 存档案
+                if save_profile and profile_name:
+                    auth.save_profile(st.session_state.username, profile_name, final_old_txt)
+                    st.toast("✅ 档案已保存！")
 
-                            st.session_state.plan = plan
-                            st.session_state.kv_df = pd.DataFrame(plan['kv'])
-                            st.session_state.step = 2
-                            auth.log_action(st.session_state.username, f"Analysis: {f_new.name}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"处理失败: {e}")
+                # 存Session
+                st.session_state.template_bytes = f_new.getvalue()
+                st.session_state.user_filename_display = f_new.name
+
+            # 路径 2: 用档案
+            elif p_old_text and (f_new or f_new_archive):
+                final_file = f_new if f_new else f_new_archive
+                if not os.path.exists("temp"): os.makedirs("temp")
+                final_new_path = os.path.join("temp", "target_template.docx")
+                with open(final_new_path, "wb") as f:
+                    f.write(final_file.getbuffer())
+
+                final_old_txt = p_old_text
+                st.session_state.template_bytes = final_file.getvalue()
+                st.session_state.user_filename_display = final_file.name
+            else:
+                st.error("请上传文件或选择档案")
+                st.stop()
+
+            # 开始分析
+            with st.spinner("正在读取文档并构建知识图谱..."):
+                try:
+                    # 再次预检目标文件
+                    valid, msg = logic.validate_file_format(final_new_path)
+                    if not valid:
+                        st.error(msg)
+                        st.stop()
+
+                    new_txt = logic.read_file_content(final_new_path)
+                    st.session_state.source_text_display = final_old_txt  # 存下来给用户看
+
+                    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+                    plan = logic.generate_filling_plan_v2(client, final_old_txt, new_txt)
+
+                    st.session_state.plan = plan
+                    st.session_state.kv_df = pd.DataFrame(plan['kv'])
+                    st.session_state.step = 2
+                    auth.log_action(st.session_state.username, "Analysis Started")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"处理失败: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # 步骤 2: 审核
+    # ================== 步骤 2: 审核 (增加源数据透视) ==================
     elif st.session_state.step == 2:
-        st.markdown("""
-        <div class="w2w-card">
-            <div class="w2w-header">📊 步骤 2: 数据核对</div>
-            <div class="w2w-desc">AI 已从源文件中提取数据。您可以自由修改，或使用 AI 润色工具。</div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            """<div class="w2w-card"><div class="w2w-header">📊 步骤 2: 数据核对</div><div class="w2w-desc">AI 已从源文件中提取数据。</div>""",
+            unsafe_allow_html=True)
 
+        # 新增：查看 AI 读到了什么
+        with st.expander("🔍 [调试] 查看 AI 读取到的源文件内容"):
+            st.text_area("源文本快照", st.session_state.source_text_display, height=200, disabled=True)
+            st.caption("如果这里没有你需要的数据，说明源文件格式太复杂，AI 没读出来。")
+
+        # ======================= 【新增】核心调试功能 =======================
+        # 2. JSON 结构调试窗口 (专门用来检查数据到底去哪了)
+        with st.expander("🧩 [调试] 查看 AI 返回的原始 JSON (排查写入失败)"):
+            st.info(
+                "💡 关键检查点：\n1. 你的“社会工作/奖惩情况”是不是在 `kv` 列表里？(在 kv 才能写入大单元格)\n2. `anchor` (定位词) 的名字是不是和 Word 模板里的文字能对应上？")
+            st.json(st.session_state.plan)
+        # ===================================================================
+
+        # 数据编辑器
         edited_df = st.data_editor(
             st.session_state.kv_df,
             column_config={"anchor": "字段", "val": st.column_config.TextColumn("内容", width="large"),
@@ -213,24 +275,22 @@ def user_page():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+        # AI 润色区
         st.markdown("""<div class="w2w-card"><div class="w2w-header">✨ AI 润色</div>""", unsafe_allow_html=True)
         c1, c2, c3 = st.columns([2, 2, 1])
         t_target = c1.selectbox("选择字段", edited_df['anchor'].tolist())
         t_prompt = c2.text_input("指令", placeholder="例如：扩充到200字，语气更自信")
         if c3.button("执行", use_container_width=True):
-            if not api_key:
-                st.error("No Key")
-            else:
-                client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-                idx = st.session_state.kv_df.index[st.session_state.kv_df['anchor'] == t_target].tolist()[0]
-                curr = edited_df.loc[idx, 'val']
-                new_val = logic.refine_text_v2(client, curr, t_prompt)
-                st.session_state.kv_df.at[idx, 'val'] = new_val
-                st.rerun()
+            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+            idx = st.session_state.kv_df.index[st.session_state.kv_df['anchor'] == t_target].tolist()[0]
+            curr = edited_df.loc[idx, 'val']
+            new_val = logic.refine_text_v2(client, curr, t_prompt)
+            st.session_state.kv_df.at[idx, 'val'] = new_val
+            st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
         c_b1, c_b2 = st.columns(2)
-        if c_b1.button("🔙 返回"):
+        if c_b1.button("🔙 返回重传"):
             st.session_state.step = 1
             st.rerun()
         if c_b2.button("✅ 确认生成", type="primary"):
@@ -238,60 +298,55 @@ def user_page():
             st.session_state.step = 3
             st.rerun()
 
-    # 步骤 3: 写入
+    # ================== 步骤 3: 写入 (增加错误回退) ==================
     elif st.session_state.step == 3:
-        st.markdown("""
-        <div class="w2w-card" style="text-align:center; padding:40px;">
-            <h3 style="color:#4F46E5;">⚙️ 正在写入 V1.0 文档...</h3>
-            <p style="color:#6B7280;">AI 引擎正在处理格式对齐与列表克隆。</p>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown(
+            """<div class="w2w-card" style="text-align:center; padding:40px;"><h3 style="color:#4F46E5;">⚙️ 正在写入 V1.0 文档...</h3></div>""",
+            unsafe_allow_html=True)
         bar = st.progress(0)
 
-        def update_bar(p, msg):
-            bar.progress(p, text=msg)
-            time.sleep(0.05)
-
         try:
-            # 文件名
             p_template = os.path.join("temp", "target_template.docx")
             p_out = os.path.join("temp", "final_result.docx")
 
-            # 强制覆盖逻辑
+            # 强制恢复文件
             if st.session_state.get('template_bytes'):
                 if not os.path.exists("temp"): os.makedirs("temp")
                 with open(p_template, "wb") as f:
                     f.write(st.session_state.template_bytes)
             else:
-                if not os.path.exists(p_template):
-                    st.error("⚠️ 关键文件丢失（会话已过期）。请刷新页面重新上传。")
-                    st.stop()
+                st.error("⚠️ 会话过期")
+                if st.button("🔙 返回首页"):
+                    st.session_state.step = 1
+                    st.rerun()
+                st.stop()
 
-            logic.execute_word_writing_v2(
-                st.session_state.plan, p_template, p_out, progress_callback=update_bar
-            )
+            def update_bar(p, msg):
+                bar.progress(p, text=msg)
+                time.sleep(0.05)
 
-            auth.log_action(st.session_state.username, f"Completed: {st.session_state.user_filename_display}")
-
+            logic.execute_word_writing_v2(st.session_state.plan, p_template, p_out, progress_callback=update_bar)
+            auth.log_action(st.session_state.username, "Completed")
             st.success("处理完成！")
 
-            # 下载逻辑
             output_name = f"WordToWord_V1.0_{st.session_state.user_filename_display}"
-
             with open(p_out, "rb") as f:
-                st.download_button("📥 下载结果", f,
-                                   file_name=output_name,
+                st.download_button("📥 下载结果", f, file_name=output_name,
                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                    type="primary", use_container_width=True)
 
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("新任务"):
+            # 成功后也给一个返回按钮
+            if st.button("🔄 开始新任务"):
                 st.session_state.step = 1
                 st.rerun()
+
         except Exception as e:
-            st.error(f"处理出错: {e}")
-            print(f"Error detail: {str(e)}")
+            st.error(f"写入出错: {e}")
+            # 关键：出错时给一个巨大的返回按钮
+            st.markdown("### ⚠️ 遇到问题了？")
+            if st.button("🔙 返回第一步 (重新上传)", type="primary"):
+                st.session_state.step = 1
+                st.rerun()
 
 
 # ================= 路由 =================
