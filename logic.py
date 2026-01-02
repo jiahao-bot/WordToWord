@@ -384,11 +384,42 @@ def force_write_cell(cell, text, alignment="auto"):
     run.font.color.rgb = RGBColor(0, 0, 0)
 
 
+def append_write_cell(cell, text, alignment="left"):
+    """
+    保留原有内容，追加新内容（避免覆盖标题/标签）
+    """
+    if text is None:
+        text = ""
+    if not cell.text.strip():
+        force_write_cell(cell, text, alignment=alignment)
+        return
+
+    p = cell.add_paragraph()
+    if alignment == "left":
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+    run = p.add_run(str(text))
+    run.font.name = '宋体'
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+    run.font.size = Pt(10.5)
+    run.font.color.rgb = RGBColor(0, 0, 0)
+
+
 def get_next_distinct_cell(row, current_idx):
     current_cell = row.cells[current_idx]
     for i in range(current_idx + 1, len(row.cells)):
         next_cell = row.cells[i]
         if next_cell._element is not current_cell._element:
+            return next_cell
+    return None
+
+
+def find_next_writable_cell(row, current_idx):
+    current_cell = row.cells[current_idx]
+    for i in range(current_idx + 1, len(row.cells)):
+        next_cell = row.cells[i]
+        if next_cell._element is current_cell._element:
+            continue
+        if not next_cell.text.strip():
             return next_cell
     return None
 
@@ -450,6 +481,11 @@ def get_fuzzy_score(anchor, target_text):
     return difflib.SequenceMatcher(None, a, t).ratio()
 
 
+def is_placeholder_text(text):
+    clean = text.replace(" ", "")
+    return any(k in clean for k in ["此栏", "填写", "说明", "简述", "备注"])
+
+
 # --- 辅助函数：设置单元格为纵向合并的“继续”状态 ---
 def set_cell_merge_continue(cell):
     """
@@ -509,6 +545,7 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
 
     # ---------------- 1. KV 写入 ----------------
     total_kv = len(plan.get("kv", []))
+    anchor_usage = {}
     for i, item in enumerate(plan.get("kv", [])):
         anchor, val = item["anchor"], item["val"]
         if not val: continue
@@ -522,16 +559,24 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                     cell_text = cell.text.strip().replace(" ", "")
                     clean_anchor = anchor.strip().replace(" ", "")
                     match_score = get_fuzzy_score(clean_anchor, cell_text)
+                    strict_match = clean_anchor in cell_text or cell_text in clean_anchor
+                    short_anchor = len(clean_anchor) <= 8
+                    if (short_anchor and not strict_match):
+                        continue
 
-                    if match_score > 0.8:
+                    if strict_match or match_score > 0.9:
+                        used_cells = anchor_usage.get(anchor, set())
+                        if cell._element in used_cells:
+                            continue
                         target_cell = None
-                        # 大格子逻辑 (自我鉴定)
-                        if len(cell_text) > 20 or "此栏" in cell_text or "填写" in cell_text:
-                            target_cell = cell
-                            # 普通 KV 逻辑 (学号、姓名)
+                        candidate = find_next_writable_cell(row, c_idx)
+
+                        # 优先写入相邻可写单元格
+                        if candidate:
+                            target_cell = candidate
                         else:
-                            candidate = get_next_distinct_cell(row, c_idx)
-                            if candidate: target_cell = candidate
+                            # 无相邻单元格时，才考虑写入当前单元格
+                            target_cell = cell
 
                         if target_cell:
                             # 保护机制：防止覆盖表头
@@ -539,7 +584,12 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                             if len(target_cell.text) < 10 and ("：" in target_cell.text or ":" in target_cell.text):
                                 pass
                             else:
-                                force_write_cell(target_cell, val, alignment="auto")
+                                if target_cell is cell:
+                                    append_write_cell(target_cell, val, alignment="left")
+                                else:
+                                    force_write_cell(target_cell, val, alignment="auto")
+                                used_cells.add(cell._element)
+                                anchor_usage[anchor] = used_cells
                                 found = True
                                 break
                 if found: break
