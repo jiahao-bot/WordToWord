@@ -24,6 +24,9 @@ if 'template_bytes' not in st.session_state: st.session_state.template_bytes = N
 if 'user_filename_display' not in st.session_state: st.session_state.user_filename_display = "template.docx"
 # 新增：用于存储当前使用的源数据文本（用于展示）
 if 'source_text_display' not in st.session_state: st.session_state.source_text_display = ""
+if 'last_usage' not in st.session_state: st.session_state.last_usage = None
+if 'preview_bytes' not in st.session_state: st.session_state.preview_bytes = None
+if 'preview_data' not in st.session_state: st.session_state.preview_data = None
 
 
 # ================= 登录页 =================
@@ -85,6 +88,16 @@ def user_page():
         # 自动加载 API Key
         saved_key = auth.get_user_apikey(st.session_state.username)
         api_key = st.text_input("DeepSeek API Key", value=saved_key, type="password")
+        raw_model_config = auth.get_user_model_config(st.session_state.username)
+        model_settings = logic.normalize_model_settings({
+            "base_url": raw_model_config.get("base_url"),
+            "model": raw_model_config.get("model_name"),
+            "temperature": raw_model_config.get("temperature"),
+            "top_p": raw_model_config.get("top_p"),
+            "max_tokens": raw_model_config.get("max_tokens"),
+            "frequency_penalty": raw_model_config.get("frequency_penalty"),
+            "presence_penalty": raw_model_config.get("presence_penalty"),
+        })
 
         # 如果 Key 变了，自动保存
         if api_key != saved_key and api_key:
@@ -94,6 +107,53 @@ def user_page():
         if not api_key: st.warning("⚠️ 请输入 API Key")
 
         st.divider()
+        with st.expander("🤖 模型设置", expanded=False):
+            base_url = st.text_input("API Base URL", value=model_settings["base_url"])
+            model_name = st.text_input("模型名称", value=model_settings["model"])
+            temperature = st.slider("temperature", 0.0, 1.0, value=float(model_settings["temperature"]), step=0.05)
+            top_p = st.slider("top_p", 0.0, 1.0, value=float(model_settings["top_p"]), step=0.05)
+            max_tokens_input = st.text_input(
+                "max_tokens (留空表示不限制)",
+                value="" if model_settings["max_tokens"] is None else str(int(model_settings["max_tokens"])),
+            )
+            frequency_penalty = st.slider("frequency_penalty", -2.0, 2.0, value=float(model_settings["frequency_penalty"]), step=0.1)
+            presence_penalty = st.slider("presence_penalty", -2.0, 2.0, value=float(model_settings["presence_penalty"]), step=0.1)
+            max_tokens_value = None
+            if max_tokens_input.strip():
+                if max_tokens_input.strip().isdigit():
+                    max_tokens_value = int(max_tokens_input.strip())
+                else:
+                    st.warning("max_tokens 必须为整数")
+
+            new_model_config = {
+                "base_url": base_url.strip(),
+                "model_name": model_name.strip(),
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+                "max_tokens": max_tokens_value,
+                "frequency_penalty": float(frequency_penalty),
+                "presence_penalty": float(presence_penalty),
+            }
+            if new_model_config != raw_model_config:
+                auth.save_user_model_config(st.session_state.username, new_model_config)
+                st.toast("✅ 模型配置已保存")
+
+            model_settings = logic.normalize_model_settings({
+                "base_url": new_model_config["base_url"],
+                "model": new_model_config["model_name"],
+                "temperature": new_model_config["temperature"],
+                "top_p": new_model_config["top_p"],
+                "max_tokens": new_model_config["max_tokens"],
+                "frequency_penalty": new_model_config["frequency_penalty"],
+                "presence_penalty": new_model_config["presence_penalty"],
+            })
+
+            if st.session_state.last_usage:
+                usage = st.session_state.last_usage
+                st.caption(
+                    f"本次消耗 tokens：prompt={usage.get('prompt_tokens')} / completion={usage.get('completion_tokens')} / total={usage.get('total_tokens')}"
+                )
+
         with st.expander("📖 V1.0 使用指南", expanded=False):
             st.markdown(styles.get_guide_html(), unsafe_allow_html=True)
 
@@ -182,6 +242,9 @@ def user_page():
             # 确定源数据来源
             final_old_txt = ""
             final_new_path = ""
+            st.session_state.preview_bytes = None
+            st.session_state.preview_data = None
+            st.session_state.last_usage = None
 
             # 路径 1: 新上传
             if f_old and f_new:
@@ -236,16 +299,21 @@ def user_page():
                     new_txt = logic.read_file_content(final_new_path)
                     st.session_state.source_text_display = final_old_txt  # 存下来给用户看
 
-                    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-                    plan = logic.generate_filling_plan_v2(client, final_old_txt, new_txt)
+                    client = OpenAI(api_key=api_key, base_url=model_settings["base_url"])
+                    plan = logic.generate_filling_plan_v2(client, final_old_txt, new_txt, model_settings=model_settings)
+                    plan = logic.adjust_plan_for_template(plan, final_new_path)
 
                     st.session_state.plan = plan
                     st.session_state.kv_df = pd.DataFrame(plan['kv'])
+                    st.session_state.last_usage = plan.get("usage") if isinstance(plan, dict) else None
                     st.session_state.step = 2
                     auth.log_action(st.session_state.username, "Analysis Started")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"处理失败: {e}")
+                    if logic.is_quota_error(e):
+                        st.warning("⚠️ API 额度已用完，请先充值后再试。")
+                    else:
+                        st.error(f"处理失败: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     # ================== 步骤 2: 审核 (增加源数据透视) ==================
@@ -290,12 +358,18 @@ def user_page():
         t_target = c1.selectbox("选择字段", edited_df['anchor'].tolist())
         t_prompt = c2.text_input("指令", placeholder="例如：扩充到200字，语气更自信")
         if c3.button("执行", use_container_width=True):
-            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-            idx = st.session_state.kv_df.index[st.session_state.kv_df['anchor'] == t_target].tolist()[0]
-            curr = edited_df.loc[idx, 'val']
-            new_val = logic.refine_text_v2(client, curr, t_prompt)
-            st.session_state.kv_df.at[idx, 'val'] = new_val
-            st.rerun()
+            try:
+                client = OpenAI(api_key=api_key, base_url=model_settings["base_url"])
+                idx = st.session_state.kv_df.index[st.session_state.kv_df['anchor'] == t_target].tolist()[0]
+                curr = edited_df.loc[idx, 'val']
+                new_val = logic.refine_text_v2(client, curr, t_prompt, model_settings=model_settings)
+                st.session_state.kv_df.at[idx, 'val'] = new_val
+                st.rerun()
+            except Exception as e:
+                if logic.is_quota_error(e):
+                    st.warning("⚠️ API 额度已用完，请先充值后再试。")
+                else:
+                    st.error(f"润色失败: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
         c_b1, c_b2 = st.columns(2)
@@ -304,16 +378,18 @@ def user_page():
             st.rerun()
         if c_b2.button("✅ 确认生成", type="primary"):
             st.session_state.plan['kv'] = edited_df.to_dict('records')
+            st.session_state.preview_bytes = None
+            st.session_state.preview_data = None
             st.session_state.step = 3
             st.rerun()
 
-    # ================== 步骤 3: 写入 (增加错误回退) ==================
+    # ================== 步骤 3: 预览 (生成前检查) ==================
     elif st.session_state.step == 3:
         st.markdown(
-            """<div class="w2w-card" style="text-align:center; padding:40px;"><h3 style="color:#4F46E5;">⚙️ 正在写入 V1.0 文档...</h3></div>""",
+            """<div class="w2w-card"><div class="w2w-header">👀 步骤 3: 预览确认</div><div class="w2w-desc">在下载前先查看预览效果，确认无误再生成最终结果。</div>""",
             unsafe_allow_html=True)
-        bar = st.progress(0)
 
+        bar = st.progress(0)
         try:
             p_template = os.path.join("temp", "target_template.docx")
             p_out = os.path.join("temp", "final_result.docx")
@@ -330,40 +406,93 @@ def user_page():
                     st.rerun()
                 st.stop()
 
-            def update_bar(p, msg):
-                bar.progress(p, text=msg)
-                time.sleep(0.05)
+            if st.session_state.preview_bytes is None:
+                def update_bar(p, msg):
+                    bar.progress(p, text=msg)
+                    time.sleep(0.05)
 
-            logic.execute_word_writing_v2(st.session_state.plan, p_template, p_out, progress_callback=update_bar)
-            auth.log_action(st.session_state.username, "Completed")
-            st.success("处理完成！")
+                logic.execute_word_writing_v2(st.session_state.plan, p_template, p_out, progress_callback=update_bar)
+                with open(p_out, "rb") as f:
+                    st.session_state.preview_bytes = f.read()
+                st.session_state.preview_data = logic.get_docx_preview_data(p_out)
+
+            paragraphs, tables = st.session_state.preview_data or ([], [])
+            with st.expander("📄 文本预览 (格式仅供参考)", expanded=True):
+                if paragraphs:
+                    st.text_area("预览内容", "\n".join(paragraphs), height=260, disabled=True)
+                else:
+                    st.info("未检测到正文文本预览。")
+
+            if tables:
+                for idx, table in enumerate(tables, start=1):
+                    with st.expander(f"📊 表格预览 {idx}"):
+                        st.dataframe(pd.DataFrame(table), use_container_width=True)
+            else:
+                st.info("未检测到表格预览。")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            col_back, col_confirm, col_new = st.columns([2, 2, 2])
+            if col_back.button("✏️ 返回修改"):
+                st.session_state.step = 2
+                st.rerun()
+            if col_confirm.button("✅ 确认生成"):
+                st.session_state.step = 4
+                st.rerun()
+            if col_new.button("🔄 开始新任务"):
+                st.session_state.step = 1
+                st.session_state.plan = None
+                st.session_state.preview_bytes = None
+                st.session_state.preview_data = None
+                if 'auto_profile_name' in st.session_state:
+                    del st.session_state.auto_profile_name
+                st.rerun()
+
+        except Exception as e:
+            st.error(f"预览生成失败: {e}")
+            st.markdown("### ⚠️ 遇到问题了？")
+            if st.button("🔙 返回第一步 (重新上传)", type="primary"):
+                st.session_state.step = 1
+                st.rerun()
+
+    # ================== 步骤 4: 写入下载 (增加错误回退) ==================
+    elif st.session_state.step == 4:
+        st.markdown(
+            """<div class="w2w-card" style="text-align:center; padding:40px;"><h3 style="color:#4F46E5;">✅ 预览完成，可下载结果</h3></div>""",
+            unsafe_allow_html=True)
+        try:
+            if not st.session_state.preview_bytes:
+                st.error("⚠️ 预览数据不存在，请返回上一步重新生成。")
+                if st.button("🔙 返回预览"):
+                    st.session_state.step = 3
+                    st.rerun()
+                st.stop()
 
             output_name = f"WordToWord_V1.0_{st.session_state.user_filename_display}"
-            # === 修改开始：使用三列布局优化按钮排版 ===
             col_dl, col_back, col_new = st.columns([3, 2, 2])
+            col_dl.download_button(
+                "📥 下载结果",
+                st.session_state.preview_bytes,
+                file_name=output_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+                use_container_width=True,
+            )
 
-            with open(p_out, "rb") as f:
-                col_dl.download_button("📥 下载结果", f, file_name=output_name,
-                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                       type="primary", use_container_width=True)
-
-            # 【新增功能】返回上一步
             if col_back.button("✏️ 不满意？返回修改"):
-                st.session_state.step = 2  # 关键：倒退回步骤 2
-                st.rerun()  # 立即刷新，编辑器会重新出现，数据还在
+                st.session_state.step = 2
+                st.rerun()
 
             if col_new.button("🔄 开始新任务"):
                 st.session_state.step = 1
-                # 清除旧的默认名
                 if 'auto_profile_name' in st.session_state:
                     del st.session_state.auto_profile_name
-                st.session_state.plan = None  # 彻底清空，防止数据残留
+                st.session_state.plan = None
+                st.session_state.preview_bytes = None
+                st.session_state.preview_data = None
                 st.rerun()
-            # === 修改结束 ===
 
         except Exception as e:
             st.error(f"写入出错: {e}")
-            # 关键：出错时给一个巨大的返回按钮
             st.markdown("### ⚠️ 遇到问题了？")
             if st.button("🔙 返回第一步 (重新上传)", type="primary"):
                 st.session_state.step = 1

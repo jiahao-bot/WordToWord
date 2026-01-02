@@ -17,6 +17,17 @@ except ImportError:
     pdfplumber = None
 
 
+DEFAULT_MODEL_SETTINGS = {
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "temperature": 0.25,
+    "top_p": 1.0,
+    "max_tokens": None,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+}
+
+
 # ================== 文件格式预检 (保持不变) ==================
 def validate_file_format(file_path):
     if not os.path.exists(file_path):
@@ -89,8 +100,33 @@ def read_file_content(file_path):
         return f"[读取错误] {str(e)}"
 
 
+def normalize_model_settings(settings=None):
+    if settings is None:
+        settings = {}
+    normalized = DEFAULT_MODEL_SETTINGS.copy()
+    for key in normalized:
+        if key in settings and settings[key] not in [None, ""]:
+            normalized[key] = settings[key]
+    return normalized
+
+
+def is_quota_error(exc):
+    message = str(exc).lower()
+    keywords = [
+        "insufficient_quota",
+        "quota",
+        "exceeded",
+        "payment_required",
+        "billing",
+        "余额",
+        "充值",
+        "额度",
+    ]
+    return any(keyword in message for keyword in keywords)
+
+
 # ================= V5 核心 Prompt (修复基础信息遗漏) =================
-def generate_filling_plan_v2(client, old_data, target_structure):
+def generate_filling_plan_v2(client, old_data, target_structure, model_settings=None):
     prompt = f"""
     你是一个专业的数据迁移专家。
 
@@ -134,11 +170,18 @@ def generate_filling_plan_v2(client, old_data, target_structure):
         ]
     }}
     """
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.25  # 微调温度，平衡创造性(软信息)和准确性(基础信息)
-    )
+    settings = normalize_model_settings(model_settings)
+    completion_kwargs = {
+        "model": settings["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": settings["temperature"],  # 微调温度，平衡创造性(软信息)和准确性(基础信息)
+        "top_p": settings["top_p"],
+        "frequency_penalty": settings["frequency_penalty"],
+        "presence_penalty": settings["presence_penalty"],
+    }
+    if settings["max_tokens"] is not None:
+        completion_kwargs["max_tokens"] = settings["max_tokens"]
+    response = client.chat.completions.create(**completion_kwargs)
     content = response.choices[0].message.content
     content = re.sub(r'```json\s*|\s*```', '', content)
 
@@ -162,17 +205,124 @@ def generate_filling_plan_v2(client, old_data, target_structure):
                             cleaned_data.append(row)
                     lst["data"] = cleaned_data
 
+        usage = response.usage.model_dump() if hasattr(response, "usage") and response.usage else None
+        if usage:
+            plan["usage"] = usage
         return plan
     except:
         return {"kv": [], "checkbox": [], "lists": []}
 
 
-def refine_text_v2(client, original_text, instruction):
+def refine_text_v2(client, original_text, instruction, model_settings=None):
     prompt = f"原文：{original_text}\n指令：{instruction}\n请输出修改后的结果："
-    response = client.chat.completions.create(
-        model="deepseek-chat", messages=[{"role": "user", "content": prompt}]
-    )
+    settings = normalize_model_settings(model_settings)
+    completion_kwargs = {
+        "model": settings["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": settings["temperature"],
+        "top_p": settings["top_p"],
+        "frequency_penalty": settings["frequency_penalty"],
+        "presence_penalty": settings["presence_penalty"],
+    }
+    if settings["max_tokens"] is not None:
+        completion_kwargs["max_tokens"] = settings["max_tokens"]
+    response = client.chat.completions.create(**completion_kwargs)
     return response.choices[0].message.content
+
+
+def get_docx_preview_data(doc_path):
+    doc = Document(doc_path)
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    tables = []
+    for table in doc.tables:
+        table_rows = []
+        for row in table.rows:
+            row_data = [cell.text.strip() for cell in row.cells]
+            if any(row_data):
+                table_rows.append(row_data)
+        if table_rows:
+            tables.append(table_rows)
+    return paragraphs, tables
+
+
+def format_list_as_text(headers, data):
+    lines = []
+    if headers:
+        lines.append(" | ".join(headers))
+    for row in data:
+        lines.append(" | ".join([str(c) for c in row]))
+    return "\n".join(lines).strip()
+
+
+def find_table_anchor(doc, keyword):
+    for table in doc.tables:
+        for r_idx, row in enumerate(table.rows):
+            for c_idx, cell in enumerate(row.cells):
+                if keyword in cell.text:
+                    return table, r_idx, c_idx
+    return None, -1, -1
+
+
+def _count_row_non_empty_cells(row):
+    return sum(1 for cell in row.cells if cell.text.strip())
+
+
+def is_probable_list_table(table, anchor_row_idx, headers):
+    if len(table.columns) < 2 or len(table.rows) < 2:
+        return False
+
+    header_candidates = [anchor_row_idx, anchor_row_idx + 1]
+    for idx in header_candidates:
+        if 0 <= idx < len(table.rows):
+            row = table.rows[idx]
+            if _count_row_non_empty_cells(row) >= 2:
+                return True
+
+    if headers:
+        for row in table.rows[: min(len(table.rows), anchor_row_idx + 3)]:
+            row_text = "".join(cell.text for cell in row.cells)
+            if sum(1 for h in headers if h in row_text) >= 2:
+                return True
+
+    label_value_rows = 0
+    for row in table.rows:
+        non_empty = [cell for cell in row.cells if cell.text.strip()]
+        if len(non_empty) == 1:
+            label_value_rows += 1
+    return label_value_rows < (len(table.rows) * 0.6)
+
+
+def adjust_plan_for_template(plan, template_path):
+    if not plan:
+        return plan
+
+    doc = Document(template_path)
+    new_plan = {
+        "kv": list(plan.get("kv", [])),
+        "checkbox": list(plan.get("checkbox", [])),
+        "lists": [],
+    }
+    if "usage" in plan:
+        new_plan["usage"] = plan["usage"]
+
+    for item in plan.get("lists", []):
+        keyword = item.get("keyword", "")
+        headers = item.get("headers", [])
+        data = item.get("data", [])
+
+        target_table, anchor_row_idx, _ = find_table_anchor(doc, keyword)
+        if target_table is None:
+            new_plan["lists"].append(item)
+            continue
+
+        if not is_probable_list_table(target_table, anchor_row_idx, headers):
+            formatted = format_list_as_text(headers, data)
+            if formatted:
+                new_plan["kv"].append({"anchor": keyword, "val": formatted, "source": "lists"})
+        else:
+            new_plan["lists"].append(item)
+
+    return new_plan
 
 
 # ================= 写入逻辑 =================
@@ -268,6 +418,69 @@ def get_fuzzy_score(anchor, target_text):
     return difflib.SequenceMatcher(None, a, t).ratio()
 
 
+def _cell_has_vmerge(cell):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    return tc_pr.find(qn('w:vMerge')) is not None
+
+
+def _cell_has_gridspan(cell):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    return tc_pr.find(qn('w:gridSpan')) is not None
+
+
+def is_large_text_cell(cell):
+    text = cell.text.strip()
+    if len(text) > 20:
+        return True
+    if "此栏" in text or "填写" in text:
+        return True
+    if _cell_has_vmerge(cell) or _cell_has_gridspan(cell):
+        return True
+    if "____" in text or "__" in text:
+        return True
+    return False
+
+
+def try_write_paragraph(doc, anchor, val):
+    clean_anchor = anchor.strip().replace(" ", "")
+    candidates = []
+    for idx, paragraph in enumerate(doc.paragraphs):
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        clean_text = text.replace(" ", "")
+        if clean_anchor in clean_text:
+            score = get_fuzzy_score(clean_anchor, clean_text)
+            candidates.append((score, idx, paragraph))
+
+    if not candidates:
+        return False
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    _, _, paragraph = candidates[0]
+    text = paragraph.text
+    clean_text = text.replace(" ", "")
+    if len(clean_text) > 80:
+        return False
+
+    placeholder_pattern = rf"({re.escape(anchor)}\s*[：:]\s*)(.*)"
+    match = re.search(placeholder_pattern, text)
+    if match:
+        prefix = match.group(1)
+        paragraph.text = f"{prefix}{val}"
+        return True
+
+    if "____" in text or "__" in text:
+        paragraph.text = re.sub(r"_{2,}", str(val), text)
+        return True
+
+    if text.strip() == anchor or text.strip().startswith(anchor):
+        paragraph.text = f"{anchor}：{val}"
+        return True
+
+    return False
+
+
 # --- 辅助函数：设置单元格为纵向合并的“继续”状态 ---
 def set_cell_merge_continue(cell):
     """
@@ -344,7 +557,7 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                     if match_score > 0.8:
                         target_cell = None
                         # 大格子逻辑 (自我鉴定)
-                        if len(cell_text) > 20 or "此栏" in cell_text or "填写" in cell_text:
+                        if is_large_text_cell(cell):
                             target_cell = cell
                             # 普通 KV 逻辑 (学号、姓名)
                         else:
@@ -362,6 +575,9 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                                 break
                 if found: break
             if found: break
+
+        if not found:
+            try_write_paragraph(doc, anchor, val)
 
     # ---------------- 2. Checkbox 写入 (新版匹配逻辑) ----------------
     if progress_callback: progress_callback(60, "处理勾选框...")

@@ -38,6 +38,7 @@ def init_db():
 
     # 【新增 1】用户配置表 (用于记忆 API Key 等设置)
     c.execute('''CREATE TABLE IF NOT EXISTS user_config (username TEXT PRIMARY KEY, api_key TEXT, updated_at TEXT)''')
+    _ensure_user_config_columns(conn)
 
     # 【新增 2】用户档案表 (用于记忆上传过的简历/文档内容)
     c.execute(
@@ -51,6 +52,25 @@ def init_db():
                   (ADMIN_USER, pwd_hash, 'admin', datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
+
+
+def _ensure_user_config_columns(conn):
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(user_config)")
+    existing = {row[1] for row in c.fetchall()}
+    columns = {
+        "base_url": "TEXT",
+        "model_name": "TEXT",
+        "temperature": "REAL",
+        "top_p": "REAL",
+        "max_tokens": "INTEGER",
+        "frequency_penalty": "REAL",
+        "presence_penalty": "REAL",
+    }
+    for name, col_type in columns.items():
+        if name not in existing:
+            c.execute(f"ALTER TABLE user_config ADD COLUMN {name} {col_type}")
+    conn.commit()
 
 
 # --- 用户认证 ---
@@ -83,9 +103,13 @@ def save_user_apikey(username, api_key):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 插入或更新
-    c.execute("INSERT OR REPLACE INTO user_config (username, api_key, updated_at) VALUES (?, ?, ?)",
-              (username, api_key, timestamp))
+    c.execute("SELECT username FROM user_config WHERE username=?", (username,))
+    if c.fetchone():
+        c.execute("UPDATE user_config SET api_key=?, updated_at=? WHERE username=?",
+                  (api_key, timestamp, username))
+    else:
+        c.execute("INSERT INTO user_config (username, api_key, updated_at) VALUES (?, ?, ?)",
+                  (username, api_key, timestamp))
     conn.commit()
     conn.close()
 
@@ -97,6 +121,49 @@ def get_user_apikey(username):
     res = c.fetchone()
     conn.close()
     return res[0] if res else ""
+
+
+def get_user_model_config(username):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """SELECT base_url, model_name, temperature, top_p, max_tokens, frequency_penalty, presence_penalty
+           FROM user_config WHERE username=?""",
+        (username,),
+    )
+    res = c.fetchone()
+    conn.close()
+    if not res:
+        return {}
+    keys = ["base_url", "model_name", "temperature", "top_p", "max_tokens", "frequency_penalty", "presence_penalty"]
+    return {k: v for k, v in zip(keys, res)}
+
+
+def save_user_model_config(username, config):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fields = ["base_url", "model_name", "temperature", "top_p", "max_tokens", "frequency_penalty", "presence_penalty"]
+    values = [config.get(field) for field in fields]
+    c.execute("SELECT username FROM user_config WHERE username=?", (username,))
+    if c.fetchone():
+        c.execute(
+            """UPDATE user_config
+               SET base_url=?, model_name=?, temperature=?, top_p=?, max_tokens=?,
+                   frequency_penalty=?, presence_penalty=?, updated_at=?
+               WHERE username=?""",
+            (*values, timestamp, username),
+        )
+    else:
+        c.execute(
+            """INSERT INTO user_config
+               (username, base_url, model_name, temperature, top_p, max_tokens,
+                frequency_penalty, presence_penalty, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (username, *values, timestamp),
+        )
+    conn.commit()
+    conn.close()
 
 
 # --- 档案记忆 (简历内容) ---
