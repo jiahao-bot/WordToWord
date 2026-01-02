@@ -107,6 +107,41 @@ def _find_keyword_location(doc, keyword):
     return None, -1, -1
 
 
+def _find_keyword_location_fuzzy(doc, keyword, threshold=0.85):
+    if not keyword:
+        return None, -1, -1
+    best = (None, -1, -1, 0.0)
+    for table in doc.tables:
+        for r_idx, row in enumerate(table.rows):
+            for c_idx, cell in enumerate(row.cells):
+                score = get_fuzzy_score(keyword, cell.text)
+                if score > best[3]:
+                    best = (table, r_idx, c_idx, score)
+    if best[3] >= threshold:
+        return best[0], best[1], best[2]
+    return None, -1, -1
+
+
+def _table_distinct_cols(table, max_rows=6):
+    distinct_counts = []
+    for row in table.rows[:max_rows]:
+        distinct_counts.append(_count_distinct_cells(row))
+    return max(distinct_counts) if distinct_counts else 0
+
+
+def _row_header_hit_count(row, headers):
+    if not row or not headers:
+        return 0
+    row_text = "".join(cell.text for cell in row.cells)
+    return sum(1 for h in headers if h and h in row_text)
+
+
+def _cell_vertically_merged(table, row_idx, col_idx):
+    if row_idx + 1 >= len(table.rows):
+        return False
+    return table.rows[row_idx].cells[col_idx]._element is table.rows[row_idx + 1].cells[col_idx]._element
+
+
 def normalize_plan_with_template(plan, template_path):
     """
     根据模板结构，将误判的 lists 自动降级为 kv，避免破坏格式。
@@ -127,6 +162,8 @@ def normalize_plan_with_template(plan, template_path):
 
         table, r_idx, c_idx = _find_keyword_location(doc, keyword)
         if table is None:
+            table, r_idx, c_idx = _find_keyword_location_fuzzy(doc, keyword)
+        if table is None:
             lists.append(item)
             continue
 
@@ -138,17 +175,32 @@ def normalize_plan_with_template(plan, template_path):
         next_distinct = _count_distinct_cells(next_row) if next_row else 0
         next_filled = _count_filled_cells(next_row) if next_row else 0
 
-        header_text = ""
-        if next_row:
-            header_text = "".join(cell.text for cell in next_row.cells)
-        header_hits = sum(1 for h in headers if h and h in header_text)
+        header_hits = max(
+            _row_header_hit_count(row, headers),
+            _row_header_hit_count(next_row, headers)
+        )
+
+        data_width = 0
+        for row_data in data:
+            if isinstance(row_data, (list, tuple)):
+                data_width = max(data_width, len(row_data))
+            else:
+                data_width = max(data_width, 1)
+
+        distinct_cols = _table_distinct_cols(table)
+        is_vertically_merged = _cell_vertically_merged(table, r_idx, c_idx)
 
         looks_like_table = (
-            distinct_cells >= 3
+            distinct_cols >= 3
             or next_distinct >= 3
-            or header_hits >= 2
-            or (filled_cells >= 2 and next_filled >= 2)
+            or (header_hits >= 2 and distinct_cols >= max(2, len(headers)))
+            or (filled_cells >= 2 and next_filled >= 2 and distinct_cols >= 2)
         )
+
+        if data_width <= 1 and distinct_cols <= 2:
+            looks_like_table = False
+        if is_vertically_merged and distinct_cols <= 2 and header_hits == 0:
+            looks_like_table = False
 
         if looks_like_table:
             lists.append(item)
