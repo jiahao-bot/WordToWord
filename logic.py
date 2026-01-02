@@ -89,8 +89,122 @@ def read_file_content(file_path):
         return f"[读取错误] {str(e)}"
 
 
+def _count_distinct_cells(row):
+    elements = {id(cell._element) for cell in row.cells}
+    return len(elements)
+
+
+def _count_filled_cells(row):
+    return sum(1 for cell in row.cells if cell.text.strip())
+
+
+def _find_keyword_location(doc, keyword):
+    for table in doc.tables:
+        for r_idx, row in enumerate(table.rows):
+            for c_idx, cell in enumerate(row.cells):
+                if keyword and keyword in cell.text:
+                    return table, r_idx, c_idx
+    return None, -1, -1
+
+
+def normalize_plan_with_template(plan, template_path):
+    """
+    根据模板结构，将误判的 lists 自动降级为 kv，避免破坏格式。
+    """
+    if not plan or not plan.get("lists"):
+        return plan
+    if not zipfile.is_zipfile(template_path):
+        return plan
+
+    doc = Document(template_path)
+    kv = plan.get("kv", [])
+    lists = []
+
+    for item in plan.get("lists", []):
+        keyword = item.get("keyword", "")
+        headers = item.get("headers", [])
+        data = item.get("data", [])
+
+        table, r_idx, c_idx = _find_keyword_location(doc, keyword)
+        if table is None:
+            lists.append(item)
+            continue
+
+        row = table.rows[r_idx]
+        distinct_cells = _count_distinct_cells(row)
+        filled_cells = _count_filled_cells(row)
+
+        next_row = table.rows[r_idx + 1] if r_idx + 1 < len(table.rows) else None
+        next_distinct = _count_distinct_cells(next_row) if next_row else 0
+        next_filled = _count_filled_cells(next_row) if next_row else 0
+
+        header_text = ""
+        if next_row:
+            header_text = "".join(cell.text for cell in next_row.cells)
+        header_hits = sum(1 for h in headers if h and h in header_text)
+
+        looks_like_table = (
+            distinct_cells >= 3
+            or next_distinct >= 3
+            or header_hits >= 2
+            or (filled_cells >= 2 and next_filled >= 2)
+        )
+
+        if looks_like_table:
+            lists.append(item)
+            continue
+
+        row_lines = []
+        for row_data in data:
+            if isinstance(row_data, (list, tuple)):
+                line = " ".join(str(cell).strip() for cell in row_data if str(cell).strip())
+            else:
+                line = str(row_data).strip()
+            if line:
+                row_lines.append(line)
+        merged_text = "\n".join(row_lines)
+
+        if merged_text:
+            existing = next((entry for entry in kv if entry.get("anchor") == keyword), None)
+            if existing:
+                if existing.get("val"):
+                    existing["val"] = f"{existing['val']}\n{merged_text}"
+                else:
+                    existing["val"] = merged_text
+            else:
+                kv.append({"anchor": keyword, "val": merged_text})
+
+    plan["kv"] = kv
+    plan["lists"] = lists
+    return plan
+
+
+def extract_docx_preview(file_path, max_paragraphs=20, max_tables=5, max_rows=8):
+    if not zipfile.is_zipfile(file_path):
+        return {"paragraphs": [], "tables": []}
+    doc = Document(file_path)
+
+    paragraphs = []
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if text:
+            paragraphs.append(text)
+        if len(paragraphs) >= max_paragraphs:
+            break
+
+    tables = []
+    for table in doc.tables[:max_tables]:
+        rows = []
+        for row in table.rows[:max_rows]:
+            rows.append([cell.text.strip() for cell in row.cells])
+        tables.append(rows)
+
+    return {"paragraphs": paragraphs, "tables": tables}
+
+
 # ================= V5 核心 Prompt (修复基础信息遗漏) =================
-def generate_filling_plan_v2(client, old_data, target_structure):
+def generate_filling_plan_v2(client, old_data, target_structure, model="deepseek-chat", temperature=0.25,
+                             max_tokens=None, return_usage=False):
     prompt = f"""
     你是一个专业的数据迁移专家。
 
@@ -134,11 +248,14 @@ def generate_filling_plan_v2(client, old_data, target_structure):
         ]
     }}
     """
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.25  # 微调温度，平衡创造性(软信息)和准确性(基础信息)
-    )
+    request_kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature
+    }
+    if max_tokens is not None:
+        request_kwargs["max_tokens"] = max_tokens
+    response = client.chat.completions.create(**request_kwargs)
     content = response.choices[0].message.content
     content = re.sub(r'```json\s*|\s*```', '', content)
 
@@ -162,17 +279,30 @@ def generate_filling_plan_v2(client, old_data, target_structure):
                             cleaned_data.append(row)
                     lst["data"] = cleaned_data
 
+        if return_usage:
+            return plan, getattr(response, "usage", None)
         return plan
     except:
+        if return_usage:
+            return {"kv": [], "checkbox": [], "lists": []}, getattr(response, "usage", None)
         return {"kv": [], "checkbox": [], "lists": []}
 
 
-def refine_text_v2(client, original_text, instruction):
+def refine_text_v2(client, original_text, instruction, model="deepseek-chat", temperature=0.7, max_tokens=None,
+                   return_usage=False):
     prompt = f"原文：{original_text}\n指令：{instruction}\n请输出修改后的结果："
-    response = client.chat.completions.create(
-        model="deepseek-chat", messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
+    request_kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature
+    }
+    if max_tokens is not None:
+        request_kwargs["max_tokens"] = max_tokens
+    response = client.chat.completions.create(**request_kwargs)
+    content = response.choices[0].message.content
+    if return_usage:
+        return content, getattr(response, "usage", None)
+    return content
 
 
 # ================= 写入逻辑 =================

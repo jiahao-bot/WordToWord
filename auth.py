@@ -38,6 +38,9 @@ def init_db():
 
     # 【新增 1】用户配置表 (用于记忆 API Key 等设置)
     c.execute('''CREATE TABLE IF NOT EXISTS user_config (username TEXT PRIMARY KEY, api_key TEXT, updated_at TEXT)''')
+    # 【新增 1.1】模型配置表 (用于记忆模型相关设置)
+    c.execute(
+        '''CREATE TABLE IF NOT EXISTS user_model_config (username TEXT PRIMARY KEY, config_json TEXT, updated_at TEXT)''')
 
     # 【新增 2】用户档案表 (用于记忆上传过的简历/文档内容)
     c.execute(
@@ -97,6 +100,31 @@ def get_user_apikey(username):
     res = c.fetchone()
     conn.close()
     return res[0] if res else ""
+
+
+# --- 模型配置记忆 ---
+def save_user_model_config(username, config):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT OR REPLACE INTO user_model_config (username, config_json, updated_at) VALUES (?, ?, ?)",
+              (username, json.dumps(config, ensure_ascii=False), timestamp))
+    conn.commit()
+    conn.close()
+
+
+def get_user_model_config(username):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT config_json FROM user_model_config WHERE username=?", (username,))
+    res = c.fetchone()
+    conn.close()
+    if not res:
+        return {}
+    try:
+        return json.loads(res[0])
+    except json.JSONDecodeError:
+        return {}
 
 
 # --- 档案记忆 (简历内容) ---

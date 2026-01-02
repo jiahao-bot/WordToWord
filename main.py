@@ -9,6 +9,36 @@ import logic
 import auth
 import styles
 
+# ================= 工具函数 =================
+def _get_usage_value(usage, key):
+    if usage is None:
+        return None
+    if hasattr(usage, key):
+        return getattr(usage, key)
+    if isinstance(usage, dict):
+        return usage.get(key)
+    return None
+
+
+def update_api_usage(usage):
+    total_tokens = _get_usage_value(usage, "total_tokens")
+    if total_tokens:
+        st.session_state.api_usage_last = total_tokens
+        st.session_state.api_usage_total += total_tokens
+
+
+def is_quota_error(exc):
+    msg = str(exc).lower()
+    status_code = getattr(exc, "status_code", None)
+    return (
+        status_code == 429
+        or "insufficient_quota" in msg
+        or "quota" in msg
+        or "余额" in msg
+        or "exceeded" in msg
+        or "rate limit" in msg
+    )
+
 # 初始化
 st.set_page_config(page_title="WordToWord V1.0", page_icon="📝", layout="wide")
 styles.inject_css()
@@ -24,6 +54,8 @@ if 'template_bytes' not in st.session_state: st.session_state.template_bytes = N
 if 'user_filename_display' not in st.session_state: st.session_state.user_filename_display = "template.docx"
 # 新增：用于存储当前使用的源数据文本（用于展示）
 if 'source_text_display' not in st.session_state: st.session_state.source_text_display = ""
+if 'api_usage_total' not in st.session_state: st.session_state.api_usage_total = 0
+if 'api_usage_last' not in st.session_state: st.session_state.api_usage_last = 0
 
 
 # ================= 登录页 =================
@@ -92,6 +124,40 @@ def user_page():
             st.toast("✅ API Key 已自动保存")
 
         if not api_key: st.warning("⚠️ 请输入 API Key")
+
+        # 模型配置
+        saved_model_config = auth.get_user_model_config(st.session_state.username)
+        default_model_config = {
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-chat",
+            "temperature": 0.25,
+            "max_tokens": 0
+        }
+        model_config = {**default_model_config, **saved_model_config}
+
+        with st.expander("🤖 模型设置", expanded=False):
+            base_url = st.text_input("API Base URL", value=model_config["base_url"])
+            model_name = st.text_input("模型名称", value=model_config["model"])
+            temperature = st.number_input("温度 (Temperature)", min_value=0.0, max_value=2.0,
+                                          value=float(model_config["temperature"]), step=0.05)
+            max_tokens = st.number_input("最大输出 Tokens (0 表示不限制)", min_value=0, max_value=8192,
+                                         value=int(model_config["max_tokens"]), step=1)
+
+            new_config = {
+                "base_url": base_url.strip(),
+                "model": model_name.strip(),
+                "temperature": float(temperature),
+                "max_tokens": int(max_tokens)
+            }
+            if new_config != model_config and new_config["base_url"] and new_config["model"]:
+                auth.save_user_model_config(st.session_state.username, new_config)
+                st.toast("✅ 模型设置已保存")
+
+        base_url = base_url or model_config["base_url"]
+        model_name = model_name or model_config["model"]
+
+        st.caption(
+            f"本次调用 Token: {st.session_state.api_usage_last} | 累计 Token: {st.session_state.api_usage_total}")
 
         st.divider()
         with st.expander("📖 V1.0 使用指南", expanded=False):
@@ -236,8 +302,19 @@ def user_page():
                     new_txt = logic.read_file_content(final_new_path)
                     st.session_state.source_text_display = final_old_txt  # 存下来给用户看
 
-                    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-                    plan = logic.generate_filling_plan_v2(client, final_old_txt, new_txt)
+                    client = OpenAI(api_key=api_key, base_url=base_url)
+                    max_tokens_value = max_tokens if max_tokens > 0 else None
+                    plan, usage = logic.generate_filling_plan_v2(
+                        client,
+                        final_old_txt,
+                        new_txt,
+                        model=model_name,
+                        temperature=temperature,
+                        max_tokens=max_tokens_value,
+                        return_usage=True
+                    )
+                    update_api_usage(usage)
+                    plan = logic.normalize_plan_with_template(plan, final_new_path)
 
                     st.session_state.plan = plan
                     st.session_state.kv_df = pd.DataFrame(plan['kv'])
@@ -245,7 +322,10 @@ def user_page():
                     auth.log_action(st.session_state.username, "Analysis Started")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"处理失败: {e}")
+                    if is_quota_error(e):
+                        st.warning("⚠️ API 额度已用完，请充值后再试。")
+                    else:
+                        st.error(f"处理失败: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     # ================== 步骤 2: 审核 (增加源数据透视) ==================
@@ -290,12 +370,28 @@ def user_page():
         t_target = c1.selectbox("选择字段", edited_df['anchor'].tolist())
         t_prompt = c2.text_input("指令", placeholder="例如：扩充到200字，语气更自信")
         if c3.button("执行", use_container_width=True):
-            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-            idx = st.session_state.kv_df.index[st.session_state.kv_df['anchor'] == t_target].tolist()[0]
-            curr = edited_df.loc[idx, 'val']
-            new_val = logic.refine_text_v2(client, curr, t_prompt)
-            st.session_state.kv_df.at[idx, 'val'] = new_val
-            st.rerun()
+            try:
+                client = OpenAI(api_key=api_key, base_url=base_url)
+                idx = st.session_state.kv_df.index[st.session_state.kv_df['anchor'] == t_target].tolist()[0]
+                curr = edited_df.loc[idx, 'val']
+                max_tokens_value = max_tokens if max_tokens > 0 else None
+                new_val, usage = logic.refine_text_v2(
+                    client,
+                    curr,
+                    t_prompt,
+                    model=model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens_value,
+                    return_usage=True
+                )
+                update_api_usage(usage)
+                st.session_state.kv_df.at[idx, 'val'] = new_val
+                st.rerun()
+            except Exception as e:
+                if is_quota_error(e):
+                    st.warning("⚠️ API 额度已用完，请充值后再试。")
+                else:
+                    st.error(f"润色失败: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
         c_b1, c_b2 = st.columns(2)
@@ -337,6 +433,20 @@ def user_page():
             logic.execute_word_writing_v2(st.session_state.plan, p_template, p_out, progress_callback=update_bar)
             auth.log_action(st.session_state.username, "Completed")
             st.success("处理完成！")
+
+            preview = logic.extract_docx_preview(p_out)
+            with st.expander("👀 生成结果预览 (仅供确认格式)"):
+                if preview["paragraphs"]:
+                    st.subheader("正文")
+                    for para in preview["paragraphs"]:
+                        st.markdown(f"- {para}")
+                if preview["tables"]:
+                    st.subheader("表格")
+                    for t_idx, table in enumerate(preview["tables"], start=1):
+                        st.markdown(f"**表格 {t_idx}**")
+                        st.table(table)
+                if not preview["paragraphs"] and not preview["tables"]:
+                    st.info("未能生成预览内容，请直接下载查看。")
 
             output_name = f"WordToWord_V1.0_{st.session_state.user_filename_display}"
             # === 修改开始：使用三列布局优化按钮排版 ===
