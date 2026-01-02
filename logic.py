@@ -292,6 +292,33 @@ def is_probable_list_table(table, anchor_row_idx, headers):
     return label_value_rows < (len(table.rows) * 0.6)
 
 
+def is_soft_text_block(table, anchor_row_idx, anchor_col_idx, headers):
+    anchor_cell = table.rows[anchor_row_idx].cells[anchor_col_idx]
+    if is_large_text_cell(anchor_cell):
+        return True
+
+    if len(table.columns) <= 2:
+        empty_or_short = 0
+        for row in table.rows[anchor_row_idx:]:
+            if anchor_col_idx + 1 >= len(row.cells):
+                continue
+            right_cell = row.cells[anchor_col_idx + 1]
+            if not right_cell.text.strip() or len(right_cell.text.strip()) <= 2:
+                empty_or_short += 1
+        if empty_or_short >= max(3, int(len(table.rows) * 0.5)):
+            return True
+
+    if headers:
+        hit_count = 0
+        for row in table.rows[: min(len(table.rows), anchor_row_idx + 3)]:
+            row_text = "".join(cell.text for cell in row.cells)
+            hit_count = max(hit_count, sum(1 for h in headers if h in row_text))
+        if hit_count < 2:
+            return True
+
+    return False
+
+
 def adjust_plan_for_template(plan, template_path):
     if not plan:
         return plan
@@ -310,9 +337,15 @@ def adjust_plan_for_template(plan, template_path):
         headers = item.get("headers", [])
         data = item.get("data", [])
 
-        target_table, anchor_row_idx, _ = find_table_anchor(doc, keyword)
+        target_table, anchor_row_idx, anchor_col_idx = find_table_anchor(doc, keyword)
         if target_table is None:
             new_plan["lists"].append(item)
+            continue
+
+        if is_soft_text_block(target_table, anchor_row_idx, anchor_col_idx, headers):
+            formatted = format_list_as_text(headers, data)
+            if formatted:
+                new_plan["kv"].append({"anchor": keyword, "val": formatted, "source": "lists"})
             continue
 
         if not is_probable_list_table(target_table, anchor_row_idx, headers):
@@ -624,6 +657,9 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
         # B. 判读当前版块类型
         start_r, end_r = get_row_merge_range(target_table, anchor_row_idx, anchor_col_idx)
         is_side_block = (end_r > start_r)  # 是否为侧边栏合并类型
+
+        if is_soft_text_block(target_table, anchor_row_idx, anchor_col_idx, headers):
+            continue
 
         # C. 智能确定数据起始行 (Fix: 防止写在表头上面)
         header_map = find_column_index_by_header(target_table.rows[anchor_row_idx], headers)
