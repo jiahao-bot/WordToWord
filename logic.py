@@ -313,8 +313,28 @@ def is_soft_text_block(table, anchor_row_idx, anchor_col_idx, headers):
         for row in table.rows[: min(len(table.rows), anchor_row_idx + 3)]:
             row_text = "".join(cell.text for cell in row.cells)
             hit_count = max(hit_count, sum(1 for h in headers if h in row_text))
-        if hit_count < 2:
+        if hit_count < 2 and len(table.columns) <= 2:
             return True
+
+    return False
+
+
+def is_table_like_for_list(table, anchor_row_idx):
+    if len(table.columns) < 3 or len(table.rows) < 3:
+        return False
+
+    empty_row_count = 0
+    for row in table.rows[anchor_row_idx + 1:]:
+        empty_cells = sum(1 for cell in row.cells if not cell.text.strip())
+        if empty_cells >= int(len(row.cells) * 0.6):
+            empty_row_count += 1
+    if empty_row_count >= 2:
+        return True
+
+    header_row = table.rows[anchor_row_idx]
+    header_filled = sum(1 for cell in header_row.cells if cell.text.strip())
+    if header_filled >= 3:
+        return True
 
     return False
 
@@ -342,7 +362,7 @@ def adjust_plan_for_template(plan, template_path):
             new_plan["lists"].append(item)
             continue
 
-        if is_soft_text_block(target_table, anchor_row_idx, anchor_col_idx, headers):
+        if is_soft_text_block(target_table, anchor_row_idx, anchor_col_idx, headers) and not is_table_like_for_list(target_table, anchor_row_idx):
             formatted = format_list_as_text(headers, data)
             if formatted:
                 new_plan["kv"].append({"anchor": keyword, "val": formatted, "source": "lists"})
@@ -591,7 +611,12 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                         target_cell = None
                         # 大格子逻辑 (自我鉴定)
                         if is_large_text_cell(cell):
-                            target_cell = cell
+                            if cell_text == clean_anchor or clean_anchor in cell_text:
+                                candidate = get_next_distinct_cell(row, c_idx)
+                                if candidate:
+                                    target_cell = candidate
+                            if target_cell is None:
+                                target_cell = cell
                             # 普通 KV 逻辑 (学号、姓名)
                         else:
                             candidate = get_next_distinct_cell(row, c_idx)
@@ -601,6 +626,8 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
                             # 保护机制：防止覆盖表头
                             # 如果目标格子很短，且包含冒号或看起来像另一个表头，跳过
                             if len(target_cell.text) < 10 and ("：" in target_cell.text or ":" in target_cell.text):
+                                pass
+                            elif target_cell.text.strip().replace(" ", "") == clean_anchor:
                                 pass
                             else:
                                 force_write_cell(target_cell, val, alignment="auto")
@@ -658,7 +685,7 @@ def execute_word_writing_v2(plan, template_path, output_path, progress_callback=
         start_r, end_r = get_row_merge_range(target_table, anchor_row_idx, anchor_col_idx)
         is_side_block = (end_r > start_r)  # 是否为侧边栏合并类型
 
-        if is_soft_text_block(target_table, anchor_row_idx, anchor_col_idx, headers):
+        if is_soft_text_block(target_table, anchor_row_idx, anchor_col_idx, headers) and not is_table_like_for_list(target_table, anchor_row_idx):
             continue
 
         # C. 智能确定数据起始行 (Fix: 防止写在表头上面)
